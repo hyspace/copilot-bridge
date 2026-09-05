@@ -104,6 +104,14 @@ requires_openai_auth = false
 Use `--no-codex-setup` to skip this writer if you manage
 `~/.codex/config.toml` yourself.
 
+Codex model discovery requests (`/v1/models?client_version=...`) receive a
+native Codex model catalog, generated from your account's available Copilot
+models. No per-model entries are needed in `config.toml`. This also lets new
+Responses models, such as `gpt-6-astra`, appear in the picker without a static
+bridge allowlist. Plain `/v1/models` requests keep the OpenAI-compatible format.
+Only enabled, picker-visible tool-calling models that the bridge can route are
+advertised.
+
 The managed config also keeps Codex CLI's `/status` context-window display in
 sync with Copilot model metadata. For example, GPT-5.5 shows a 1.05M context
 window through the bridge:
