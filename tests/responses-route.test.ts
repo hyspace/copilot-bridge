@@ -267,6 +267,108 @@ describe("/v1/responses route — passthrough vs translation contract", () => {
     }
   })
 
+  test("native SSE identities remain stable and can be forwarded in follow-up input", async () => {
+    await writeCodexConfig("")
+    const captured: Array<CapturedRequest> = []
+    const items = [
+      { type: "reasoning", id: "rs_first", summary: [], encrypted_content: "opaque_encrypted" },
+      { type: "message", id: "msg_first", role: "assistant", content: [{ type: "output_text", text: "Checking." }] },
+      { type: "function_call", id: "fc_first", call_id: "call_keep", name: "echo", arguments: '{"value":"ok"}' },
+    ]
+    const events = [
+      ...items.map((item, output_index) => ({
+        type: "response.output_item.added", output_index, item,
+      })),
+      { type: "response.reasoning_summary_text.delta", output_index: 0, item_id: "rs_delta", summary_index: 0, delta: "summary" },
+      { type: "response.output_text.delta", output_index: 1, item_id: "msg_delta", content_index: 0, delta: "Checking." },
+      { type: "response.function_call_arguments.delta", output_index: 2, item_id: "fc_delta", delta: '{"value":"ok"}' },
+      ...items.map((item, output_index) => ({
+        type: "response.output_item.done", output_index, item: { ...item, id: `done_${output_index}` },
+      })),
+      { type: "response.completed", response: {
+        id: "response_1", status: "completed",
+        output: items.map((item, i) => ({ ...item, id: `snapshot_${i}` })),
+      } },
+    ]
+    const upstream = new Response(events.map((event) =>
+      `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+    ).join(""), {
+      headers: {
+        "content-type": "text/event-stream",
+        "x-upstream-marker": "preserve",
+      },
+    })
+    const { app, restore: r } = buildApp(captured, () =>
+      captured.length === 1 ? upstream : responsesTextResponse("OK"),
+    )
+    restore = r
+
+    const res = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.4", input: "ping", stream: true }),
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("x-upstream-marker")).toBe("preserve")
+    expect(captured[0].url).toBe("https://upstream.test/responses")
+    expect((captured[0].body as { stream: boolean }).stream).toBe(true)
+    const output = (await res.text()).split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)) as {
+        type: string
+        output_index: number
+        item?: { id: string }
+        item_id?: string
+        response?: { output: typeof items }
+      })
+    expect(output).toHaveLength(events.length)
+    for (const event of output) {
+      if (event.item) expect(event.item.id).toBe(items[event.output_index].id)
+      if (event.item_id) expect(event.item_id).toBe(items[event.output_index].id)
+    }
+    const normalizedItems = output.at(-1)?.response?.output
+    expect(normalizedItems).toEqual(items)
+
+    const followUpInput = [
+      { role: "user", content: "ping" },
+      ...normalizedItems!,
+      { type: "function_call_output", call_id: "call_keep", output: "ok" },
+    ]
+    const followUp = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.4", input: followUpInput, stream: false }),
+    })
+    expect(followUp.status).toBe(200)
+    expect(captured).toHaveLength(2)
+    expect((captured[1].body as { input: unknown }).input).toEqual(followUpInput)
+  })
+
+  test("native JSON output IDs are not normalized, regardless of requested streaming", async () => {
+    await writeCodexConfig("")
+    for (const stream of [false, true]) {
+      const captured: Array<CapturedRequest> = []
+      const json = JSON.stringify({
+        id: "response_keep",
+        output: [{ type: "message", id: "item_keep", content: [] }],
+      })
+      const { app, restore: r } = buildApp(captured, new Response(json, {
+        headers: { "content-type": "application/json" },
+      }))
+      restore = r
+      const res = await app.request("/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5.4", input: "ping", stream }),
+      })
+      expect(res.status).toBe(200)
+      expect(await res.text()).toBe(json)
+      expect(captured).toHaveLength(1)
+      restore()
+      restore = () => {}
+    }
+  })
+
   test("injects Codex config reasoning effort when Codex omits reasoning", async () => {
     const configDir = await mkdtemp(path.join(os.tmpdir(), "codex-route-cfg-"))
     process.env.CODEX_CONFIG_PATH = path.join(configDir, "config.toml")
