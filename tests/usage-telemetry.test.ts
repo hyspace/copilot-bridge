@@ -129,4 +129,85 @@ describe("byte-transparent, bounded telemetry", () => {
     expect(records).toHaveLength(1);
     expect(records[0].nanoAiu).toBeNull();
   });
+  test("captures large legal completion events instead of dropping their trailing usage", async () => {
+    const text = `data: ${JSON.stringify({type:"response.completed",response:{
+      output:[{type:"message",content:[{type:"output_text",text:"x".repeat(700000)}]}],
+      usage:{input_tokens:120000,output_tokens:180000,input_tokens_details:{cached_tokens:110000},
+        copilot_usage:{total_nano_aiu:123000000}},
+    }})}\n\n`;
+    const {response,events}=wrap(text,"text/event-stream",200,65536);
+    expect(await response.text()).toBe(text);
+    expect(events[0]).toMatchObject({input:120000,output:180000,cached:110000,
+      tokensComplete:true,nanoAiu:123000000,tokenStatus:"reported"});
+  });
+  test("keeps the parser bounded and diagnoses an oversized usage event", async () => {
+    const text = `data: ${JSON.stringify({type:"response.completed",response:{
+      output:"x".repeat(8 * 1024 * 1024),usage:{input_tokens:9,output_tokens:8},
+    }})}\n\ndata: [DONE]\n\n`;
+    const {response,events}=wrap(text,"text/event-stream",200,65536);
+    expect(await response.text()).toBe(text);
+    expect(events[0]).toMatchObject({input:null,output:null,tokensComplete:false,tokenStatus:"size_limit"});
+  });
+  test("SSE event names work without a duplicated JSON type field", async () => {
+    const text='event: response.completed\ndata: {"response":{"usage":{"input_tokens":7,"output_tokens":2}}}\n\n';
+    const {response,events}=wrap(text,"text/event-stream",200,1);
+    expect(await response.text()).toBe(text);
+    expect(events[0]).toMatchObject({outcome:"complete",tokensComplete:true});
+  });
+  test("a usage-only Chat chunk after finish_reason is still observed", async () => {
+    const text = [
+      {choices:[{delta:{content:"test"},finish_reason:null}],usage:null},
+      {choices:[{delta:{},finish_reason:"stop"}],usage:null},
+      {choices:[],usage:{prompt_tokens:20,completion_tokens:5,total_tokens:25,
+        prompt_tokens_details:{cached_tokens:12}}},
+    ].map(v=>`data: ${JSON.stringify(v)}\n\n`).join("")+"data: [DONE]  \n\n";
+    const {response,events}=wrap(text,"Text/Event-Stream; charset=utf-8");
+    await response.text();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({input:20,output:5,cached:12,tokensComplete:true});
+  });
+  test("normal client cancellation after a terminal event is not an interrupted request", async () => {
+    let cancelled=false;
+    const records:UsageRecord[]=[];
+    const response=observeResponse(new Response(new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode(
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}\n\n')); },
+      cancel() { cancelled=true; },
+    }),{headers:{"content-type":"text/event-stream"}}),meta,r=>records.push(r));
+    const reader=response.body!.getReader();
+    await reader.read();
+    await reader.cancel();
+    expect(cancelled).toBeTrue();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({input:12,output:3,outcome:"complete",tokensComplete:true});
+  });
+  test("counters in an unfinished stream are partial, not a complete token report", async () => {
+    const {response,events}=wrap('data: {"type":"response.created","response":{"usage":{"input_tokens":12,"output_tokens":0}}}\n\n');
+    await response.text();
+    expect(events[0]).toMatchObject({input:12,output:0,tokensComplete:false,tokenStatus:"interrupted"});
+  });
+  test("token field aliases, sibling envelopes and exact total arithmetic", () => {
+    expect(usageFrom({response:{usage:null},usage:{prompt_tokens:10,completion_tokens:4,
+      cache_read_input_tokens:7}})).toMatchObject({input:10,output:4,cached:7});
+    expect(usageFrom({usage:{input_tokens:"invalid",prompt_tokens:10,completion_tokens:4,
+      prompt_cache_hit_tokens:6}})).toMatchObject({input:10,output:4,cached:6});
+    expect(usageFrom({usage:{prompt_tokens:10,total_tokens:14}})).toMatchObject({input:10,output:4});
+    expect(usageFrom({usage:{output_tokens:4,total_tokens:14}})).toMatchObject({input:10,output:4});
+    expect(usageFrom({usage:{prompt_tokens:10,total_tokens:10}})).toMatchObject({input:10,output:0});
+    expect(usageFrom({usage:{prompt_tokens:10,total_tokens:3}})?.output).toBeNull();
+    expect(usageFrom({usage:{total_tokens:14}})).toBeNull();
+    expect(usageFrom({output:[{usage:{input_tokens:1,output_tokens:2}}]})).toBeNull();
+  });
+  test("normalizes native Anthropic cached input without adding OpenAI caches twice", async () => {
+    const frames=[
+      {type:"message_start",message:{usage:{input_tokens:5,cache_read_input_tokens:30,cache_creation_input_tokens:10,output_tokens:0}}},
+      {type:"message_delta",usage:{input_tokens:3,output_tokens:12}},
+      {type:"message_delta",usage:{cache_read_input_tokens:21}},
+      {type:"message_stop"},
+    ];
+    const {response,events}=wrap(frames.map(v=>`data: ${JSON.stringify(v)}\n\n`).join(""));
+    await response.text();
+    expect(events[0]).toMatchObject({input:34,output:12,cached:21,tokensComplete:true});
+    expect(usageFrom({usage:{input_tokens:45,output_tokens:12,cache_read_input_tokens:30}})?.input).toBe(45);
+  });
 });

@@ -9,29 +9,65 @@ export interface UsageRecord {
   cached: number | null;
   /** Server-reported request charge. One credit is 1,000,000,000 nano-AIU. */
   nanoAiu: number | null;
+  /** False for an incomplete stream/snapshot, even if some counters were observed. */
+  tokensComplete?: boolean;
+  tokenStatus?: "reported" | "partial" | "not_reported" | "interrupted" | "size_limit" | "invalid_json";
   outcome: "complete" | "http_error" | "interrupted";
 }
 
-const MAX_EVENT = 256 * 1024;
-const MAX_JSON = 4 * 1024 * 1024;
+// Match the Responses normalizer: a legal completion may repeat a large output
+// before its final usage object. The old 256 KiB cap silently discarded it.
+const MAX_EVENT = 8 * 1024 * 1024;
+const MAX_JSON = 8 * 1024 * 1024;
+const MAX_RETRY_BYTES = 4 * 1024 * 1024;
 const number = (value: unknown): number | null =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 const billingNumber = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) && value >= 0
     && value <= Number.MAX_SAFE_INTEGER ? value : null;
 
-export function usageFrom(value: any) {
-  const envelope = value?.response ?? value?.message ?? value;
-  const usage = envelope?.usage;
-  const input = number(usage?.input_tokens ?? usage?.prompt_tokens);
-  const output = number(usage?.output_tokens ?? usage?.completion_tokens);
-  const result = {
-    input, output,
-    cached: number(usage?.input_tokens_details?.cached_tokens
-      ?? usage?.prompt_tokens_details?.cached_tokens),
-    nanoAiu: billingNumber(usage?.copilot_usage?.total_nano_aiu
-      ?? envelope?.copilot_usage?.total_nano_aiu),
+const firstNumber = (...values: unknown[]) =>
+  values.map(number).find(value => value !== null) ?? null;
+interface NativeUsageState { input?: number; read?: number; write?: number }
+
+export function usageFrom(value: any, nativeState: NativeUsageState = {}) {
+  let result = { input: null, output: null, cached: null, nanoAiu: null } as {
+    input: number | null; output: number | null; cached: number | null; nanoAiu: number | null;
   };
+  // Some providers put usage next to the envelope instead of inside it.
+  // Inspect only protocol-defined locations, never arbitrary tool/text payloads.
+  const nativeMessages = value?.type === "message"
+    || (typeof value?.type === "string" && value.type.startsWith("message_"));
+  for (const envelope of [value, value?.message, value?.response]) {
+    const usage = envelope?.usage;
+    let input = firstNumber(usage?.input_tokens, usage?.prompt_tokens);
+    let output = firstNumber(usage?.output_tokens, usage?.completion_tokens);
+    const total = number(usage?.total_tokens);
+    // Exact arithmetic on server counters, not a tokenizer/character estimate.
+    if (total !== null && !nativeMessages) {
+      if (input === null && output !== null && total >= output) input = total - output;
+      if (output === null && input !== null && total >= input) output = total - input;
+    }
+    const cached = firstNumber(usage?.input_tokens_details?.cached_tokens,
+      usage?.prompt_tokens_details?.cached_tokens, usage?.cache_read_input_tokens,
+      usage?.prompt_cache_hit_tokens);
+    if (nativeMessages && input !== null) {
+      nativeState.input = input;
+    }
+    if (nativeMessages) {
+      // Native Anthropic input excludes cache reads/writes, unlike OpenAI.
+      // Cache corrections and fresh-input counters can arrive in different frames.
+      nativeState.read = number(usage?.cache_read_input_tokens) ?? nativeState.read;
+      nativeState.write = number(usage?.cache_creation_input_tokens) ?? nativeState.write;
+      if (nativeState.input !== undefined) {
+        input = number(nativeState.input + (nativeState.read ?? 0) + (nativeState.write ?? 0));
+      }
+    }
+    const nanoAiu = [usage?.copilot_usage?.total_nano_aiu, envelope?.copilot_usage?.total_nano_aiu]
+      .map(billingNumber).find(value => value !== null) ?? null;
+    result = { input: input ?? result.input, output: output ?? result.output,
+      cached: cached ?? result.cached, nanoAiu: nanoAiu ?? result.nanoAiu };
+  }
   // Billing and token counters are independent. Some stream frames contain only one.
   return Object.values(result).some(value => value !== null) ? result : null;
 }
@@ -45,33 +81,45 @@ export function observeResponse(
   if (!response.body) {
     report({ ...metadata, kind: "usage", status: response.status,
       input: null, output: null, cached: null, nanoAiu: null,
+      tokensComplete: false, tokenStatus: "not_reported",
       outcome: response.ok ? "complete" : "http_error" });
     return response;
   }
-  const sse = response.headers.get("content-type")?.includes("text/event-stream") ?? false;
+  const sse = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() === "text/event-stream";
   let buffer = "";
   let overflow = false;
   let emitted = false;
-  let completed = !sse;
+  let completed = false;
   let streamFailed = false;
   let stopped = false;
   let pendingLine = "", lineHasContent = false, skipLF = false, frameSize = 0;
   let dataLines: string[] = [];
+  let eventName = "", parseLimited = false, malformed = false;
   let usage: ReturnType<typeof usageFrom> = null;
+  const nativeUsage: NativeUsageState = {};
   const decoder = new TextDecoder();
-  const emit = (interrupted = false) => {
+  const emit = () => {
     if (emitted) return;
     emitted = true;
+    const full = usage?.input != null && usage?.output != null;
+    const tokensComplete = full && completed && !streamFailed && !parseLimited;
+    const tokenStatus: UsageRecord["tokenStatus"] = tokensComplete ? "reported"
+      : parseLimited ? "size_limit" : !completed || streamFailed ? "interrupted"
+      : usage?.input != null || usage?.output != null ? "partial"
+      : malformed ? "invalid_json" : "not_reported";
     report({ ...metadata, kind: "usage", status: response.status,
       input: usage?.input ?? null, output: usage?.output ?? null, cached: usage?.cached ?? null,
       nanoAiu: usage?.nanoAiu ?? null,
-      outcome: !response.ok ? "http_error" : interrupted || !completed || streamFailed ? "interrupted" : "complete" });
+      tokensComplete, tokenStatus,
+      outcome: !response.ok ? "http_error" : !completed || streamFailed ? "interrupted" : "complete" });
   };
   const parse = (data: string) => {
-    if (data === "[DONE]") { completed = true; return; }
+    if (data.trim() === "[DONE]") { completed = true; return; }
     try {
       const value = JSON.parse(data);
-      const next = usageFrom(value);
+      const type = typeof value?.type === "string" ? value.type : eventName;
+      const next = usageFrom(value && typeof value === "object" && !Array.isArray(value)
+        ? { ...value, type } : value, nativeUsage);
       if (next) {
         // These are request-level snapshots, not per-frame charges. Never add
         // repeated/cumulative SSE counters or erase a field absent in a later frame.
@@ -81,29 +129,32 @@ export function observeResponse(
           cached: next.cached ?? usage?.cached ?? null,
           nanoAiu: next.nanoAiu ?? usage?.nanoAiu ?? null,
         };
+        if (next.input !== null && next.output !== null) parseLimited = false;
       }
-      if (value.type === "response.completed" || value.type === "message_stop") completed = true;
-      if (value.type === "response.failed" || value.type === "error") streamFailed = true;
-    } catch { /* A malformed event must not change the model response. */ }
+      if (type === "response.completed" || type === "message_stop") completed = true;
+      if (type === "response.failed" || type === "response.incomplete" || type === "error") streamFailed = true;
+    } catch { malformed = true; /* Never change the model response. */ }
   };
   const dispatchEvent = () => {
     if (!overflow && dataLines.length) {
       const data = dataLines.join("\n");
       if (data) parse(data);
     }
-    dataLines = []; frameSize = 0; overflow = false;
+    dataLines = []; frameSize = 0; overflow = false; eventName = "";
   };
   const finishLine = () => {
     if (!lineHasContent) dispatchEvent();
     else if (!overflow && (pendingLine === "data" || pendingLine.startsWith("data:"))) {
       dataLines.push(pendingLine.slice(5).replace(/^ /, ""));
+    } else if (!overflow && pendingLine.startsWith("event:")) {
+      eventName = pendingLine.slice(6).trim().slice(0, 128);
     }
     pendingLine = ""; lineHasContent = false;
   };
   const accept = (text: string) => {
     if (!sse) {
       if (overflow) return;
-      if (buffer.length + text.length > MAX_JSON) { buffer = ""; overflow = true; }
+      if (buffer.length + text.length > MAX_JSON) { buffer = ""; overflow = true; parseLimited = true; }
       else buffer += text;
       return;
     }
@@ -115,7 +166,7 @@ export function observeResponse(
       }
       lineHasContent = true;
       frameSize += character.length;
-      if (frameSize > MAX_EVENT) { overflow = true; pendingLine = ""; dataLines = []; }
+      if (frameSize > MAX_EVENT) { overflow = true; parseLimited = true; pendingLine = ""; dataLines = []; }
       else if (!overflow) pendingLine += character;
     }
   };
@@ -133,7 +184,7 @@ export function observeResponse(
         if (stopped) return;
         if (next.done) {
           accept(decoder.decode());
-          if (!sse && !overflow) parse(buffer);
+          if (!sse) { completed = true; if (!overflow) parse(buffer); }
           if (sse) { if (lineHasContent) finishLine(); dispatchEvent(); }
           buffer = "";
           emit();
@@ -145,11 +196,13 @@ export function observeResponse(
           controller.enqueue(next.value);
         }
       } catch (error) {
-        if (!stopped) { stopped = true; emit(true); release(); controller.error(error); }
+        if (!stopped) { stopped = true; emit(); release(); controller.error(error); }
       }
     },
     async cancel(reason) {
-      stopped = true; emit(true);
+      // Clients commonly cancel after receiving the protocol terminal event.
+      // That is successful completion, not a lost/failed request.
+      stopped = true; emit();
       try { await reader.cancel(reason); } finally { release(); }
     }
   });
@@ -171,7 +224,7 @@ export async function drainRetryResponse(
   signal?.addEventListener("abort", interrupt, { once: true });
   if (signal?.aborted) interrupt();
   try {
-    while (bytes < (limits.maxBytes ?? MAX_JSON)) {
+    while (bytes < (limits.maxBytes ?? MAX_RETRY_BYTES)) {
       const next = await Promise.race([reader.read(), interrupted]);
       if (!next) break;
       if (next.done) { done = true; break; }

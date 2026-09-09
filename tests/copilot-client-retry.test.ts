@@ -21,6 +21,27 @@ afterEach(() => {
 })
 
 describe("fetchCopilot retry", () => {
+  test("supervisor requests the final Chat usage chunk without mutating other routes or caller options", async () => {
+    process.env.COPILOT_BRIDGE_EVENTS_TOKEN = "test-usage-channel"
+    const bodies:any[]=[]
+    globalThis.fetch=(async (_url:unknown,init?:RequestInit)=>{
+      bodies.push(JSON.parse(String(init?.body)))
+      return new Response("{}")
+    }) as unknown as typeof fetch
+    const init={method:"POST",body:JSON.stringify({model:"test",stream:true,
+      stream_options:{include_usage:false,other_flag:true}})}
+    const originalBody=init.body
+    await fetchCopilot(provider,"/chat/completions?test=1",init)
+    await fetchCopilot(provider,"/responses",init)
+    await fetchCopilot(provider,"/chat/completions",{...init,body:'{"model":"test","stream":false}'})
+    delete process.env.COPILOT_BRIDGE_EVENTS_TOKEN
+    await fetchCopilot(provider,"/chat/completions",init)
+    expect(init.body).toBe(originalBody)
+    expect(bodies[0].stream_options).toEqual({include_usage:true,other_flag:true})
+    expect(bodies[1].stream_options.include_usage).toBeFalse()
+    expect(bodies[2].stream_options).toBeUndefined()
+    expect(bodies[3].stream_options.include_usage).toBeFalse()
+  })
   test("retries one transient upstream 5xx", async () => {
     const requestIds: Array<string> = []
     let calls = 0

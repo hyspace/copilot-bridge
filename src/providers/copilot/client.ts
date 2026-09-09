@@ -132,6 +132,16 @@ export const fetchCopilot = async (
   }
 
   let lastError: unknown
+  // Request the final usage-only chunk on the upstream Chat stream. Do this
+  // before tracing/retries, without mutating the caller's object or Responses.
+  if (bridgeEventsEnabled() && /^\/chat\/completions(?:\?|$)/.test(path) && typeof init.body === "string") {
+    const body = parseTraceBody(init.body) as { stream?: unknown; stream_options?: unknown } | undefined
+    if (body?.stream === true) {
+      const options = body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options)
+        ? body.stream_options : {}
+      init = { ...init, body: JSON.stringify({ ...body, stream_options: { ...options, include_usage: true } }) }
+    }
+  }
 
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
     init.signal?.throwIfAborted()
@@ -165,7 +175,8 @@ export const fetchCopilot = async (
       }
     } catch (error) {
       if (metadata && !reported) report({ ...metadata, kind: "usage", status: 0,
-        input: null, output: null, cached: null, nanoAiu: null, outcome: "interrupted" })
+        input: null, output: null, cached: null, nanoAiu: null, tokensComplete: false,
+        tokenStatus: "interrupted", outcome: "interrupted" })
       lastError = error
       if (init.signal?.aborted || attempt === MAX_FETCH_ATTEMPTS) {
         throw error
