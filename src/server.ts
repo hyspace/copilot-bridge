@@ -4,6 +4,8 @@ import { cors } from "hono/cors"
 import { logger } from "hono/logger"
 
 import type { BridgeConfig, BridgeEnv } from "~/lib/config"
+import { validBridgeKey } from "~/lib/access-key"
+import { emitBridgeEvent } from "~/lib/events"
 import { chatCompletionRoutes } from "~/routes/chat-completions"
 import { embeddingRoutes } from "~/routes/embeddings"
 import { messageRoutes } from "~/routes/messages"
@@ -13,6 +15,13 @@ import { usageRoutes } from "~/routes/usage"
 
 export const createServer = (config: BridgeConfig) => {
   const app = new Hono<BridgeEnv>()
+  const accessKey = process.env.COPILOT_BRIDGE_ACCESS_KEY
+  app.use("*", async (c, next) => {
+    if (accessKey && !validBridgeKey(c.req.header("x-bridge-key"), accessKey)) {
+      return c.json({ error: { message: "Missing or invalid X-Bridge-Key" } }, 401)
+    }
+    await next()
+  })
 
   app.use(logger())
   app.use("*", cors())
@@ -28,7 +37,10 @@ export const createServer = (config: BridgeConfig) => {
     }),
   )
 
-  app.get("/healthz", (c) => c.json({ ok: true }))
+  app.get("/healthz", (c) => c.json({
+    ok: true,
+    ...(process.env.COPILOT_BRIDGE_INSTANCE_ID ? { instance: process.env.COPILOT_BRIDGE_INSTANCE_ID } : {}),
+  }))
   app.route("/v1/models", modelRoutes)
   app.route("/v1/responses", responsesRoutes)
   app.route("/v1/messages", messageRoutes)
@@ -39,9 +51,16 @@ export const createServer = (config: BridgeConfig) => {
   return app
 }
 
-export const startServer = (config: BridgeConfig) =>
-  serve({
+export const startServer = (config: BridgeConfig) => {
+  const server = serve({
     fetch: createServer(config).fetch,
     hostname: config.host,
     port: config.port,
   })
+  server.on("error", (error) => {
+    emitBridgeEvent({ kind: "fatal", message: error.message })
+    console.error("Bridge listener failed:", error.message)
+    process.exit(1)
+  })
+  return server
+}

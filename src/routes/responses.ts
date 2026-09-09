@@ -637,9 +637,12 @@ responsesRoutes.post("/", async (c) => {
     }
 
     if (payload.stream && upstream.body && contentType.includes("text/event-stream")) {
+      const headers = new Headers(upstream.headers)
+      headers.delete("content-length")
+      headers.delete("content-encoding")
       return new Response(normalizeResponsesSseStream(upstream.body), {
         status: upstream.status,
-        headers: upstream.headers,
+        headers,
       })
     }
 

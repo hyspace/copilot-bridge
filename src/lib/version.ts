@@ -38,4 +38,6 @@ const readPackageVersion = (): string => {
   }
 }
 
-export const BRIDGE_VERSION = readPackageVersion()
+declare const __BRIDGE_VERSION__: string | undefined
+export const BRIDGE_VERSION =
+  typeof __BRIDGE_VERSION__ === "string" ? __BRIDGE_VERSION__ : readPackageVersion()

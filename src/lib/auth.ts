@@ -7,6 +7,7 @@ import { HTTPError } from "~/lib/error"
 import { PATHS, ensurePaths } from "~/lib/paths"
 import { runtimeState } from "~/lib/state"
 import { getModels } from "~/providers/copilot/get-models"
+import { emitBridgeEvent } from "~/lib/events"
 
 const COPILOT_VERSION = "0.26.7"
 const EDITOR_PLUGIN_VERSION = `copilot-chat/${COPILOT_VERSION}`
@@ -28,6 +29,7 @@ interface DeviceCodeResponse {
 
 interface AccessTokenResponse {
   access_token?: string
+  error?: string
 }
 
 interface CopilotTokenResponse {
@@ -42,6 +44,7 @@ interface GitHubUserResponse {
 interface AuthOptions {
   force?: boolean
   showToken?: boolean
+  refresh?: boolean
 }
 
 export interface BridgeAuthSession {
@@ -91,15 +94,23 @@ const getDeviceCode = async (): Promise<DeviceCodeResponse> => {
     throw new HTTPError("Failed to get device code", response)
   }
 
-  return (await response.json()) as DeviceCodeResponse
+  const device = (await response.json()) as DeviceCodeResponse
+  emitBridgeEvent({ kind: "authRequired", code: device.user_code,
+    url: "https://github.com/login/device", expiresIn: device.expires_in })
+  return device
 }
 
 const pollAccessToken = async (
   deviceCode: DeviceCodeResponse,
 ): Promise<string> => {
-  const sleepDuration = (deviceCode.interval + 1) * 1000
+  let sleepDuration = (deviceCode.interval + 1) * 1000
+  const deadline = Date.now() + deviceCode.expires_in * 1000
 
   while (true) {
+    if (Date.now() >= deadline) {
+      emitBridgeEvent({ kind: "authFailed", message: "GitHub device authorization expired." })
+      throw new Error("GitHub device authorization expired. Please sign in again.")
+    }
     const response = await fetch(`${GITHUB_BASE_URL}/login/oauth/access_token`, {
       method: "POST",
       headers: standardHeaders(),
@@ -119,6 +130,11 @@ const pollAccessToken = async (
     if (json.access_token) {
       return json.access_token
     }
+    if (["expired_token", "access_denied", "incorrect_device_code"].includes(json.error ?? "")) {
+      emitBridgeEvent({ kind: "authFailed", message: "GitHub device authorization expired or was denied." })
+      throw new Error("GitHub device authorization expired or was denied. Please sign in again.")
+    }
+    if (json.error === "slow_down") sleepDuration += 5000
 
     await sleep(sleepDuration)
   }
@@ -216,6 +232,7 @@ export const setupBridgeAuth = async (
     )
 
     config.copilotToken = token
+    emitBridgeEvent({ kind: "authSuccess" })
     if (options.showToken) {
       consola.info("Copilot token:", token)
     }
@@ -242,14 +259,21 @@ export const setupBridgeAuth = async (
   }
   const refreshInterval = Math.max(refreshIn - 60, 60) * 1000
 
-  setInterval(async () => {
-    try {
-      await applyCopilotToken()
-      consola.debug("Refreshed Copilot token")
-    } catch (error) {
-      consola.error("Failed to refresh Copilot token:", error)
-    }
-  }, refreshInterval)
+  if (options.refresh !== false) {
+    let refreshing = false
+    setInterval(async () => {
+      if (refreshing) return
+      refreshing = true
+      try {
+        await applyCopilotToken()
+        consola.debug("Refreshed Copilot token")
+      } catch (error) {
+        consola.error("Failed to refresh Copilot token:", error)
+      } finally {
+        refreshing = false
+      }
+    }, refreshInterval)
+  }
 
   await loadModels(config)
 

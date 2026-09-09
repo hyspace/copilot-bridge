@@ -1,3 +1,5 @@
+import { mapSSE } from "~/lib/sse-stream"
+
 interface ResponseMetadata {
   created_at?: number
   id?: string
@@ -151,59 +153,10 @@ const transformSseChunk = (
     .join("\n")
 }
 
-export const normalizeResponsesSseStream = (
-  upstreamBody: ReadableStream<Uint8Array>,
-) => {
-  const stableResponse: StableResponseMetadata = {
-    created_at: 0,
-    id: "",
-    initialized: false,
-    model: "",
-  }
-  // Per stream, O(output items), not O(tokens); no cross-request ID aliases.
+export const normalizeResponsesSseStream = (upstreamBody: ReadableStream<Uint8Array>) => {
+  const stableResponse: StableResponseMetadata = { created_at: 0, id: "", initialized: false, model: "" }
   const outputItems = new Map<number, StableOutputItem>()
-
-  const decoder = new TextDecoder()
-  const encoder = new TextEncoder()
-  let buffer = ""
-
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const reader = upstreamBody.getReader()
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-
-          if (done) {
-            break
-          }
-
-          buffer += decoder.decode(value, { stream: true })
-
-          let separatorIndex = buffer.indexOf("\n\n")
-
-          while (separatorIndex !== -1) {
-            const rawEvent = buffer.slice(0, separatorIndex)
-            buffer = buffer.slice(separatorIndex + 2)
-
-            const transformed = transformSseChunk(rawEvent, stableResponse, outputItems)
-            controller.enqueue(encoder.encode(`${transformed}\n\n`))
-
-            separatorIndex = buffer.indexOf("\n\n")
-          }
-        }
-
-        if (buffer.length > 0) {
-          const transformed = transformSseChunk(buffer, stableResponse, outputItems)
-          controller.enqueue(encoder.encode(transformed))
-        }
-      } finally {
-        outputItems.clear()
-        reader.releaseLock()
-      }
-
-      controller.close()
-    },
-  })
+  return mapSSE(upstreamBody,
+    (frame) => transformSseChunk(frame, stableResponse, outputItems),
+    () => outputItems.clear())
 }

@@ -4,6 +4,8 @@ import { appendFile } from "node:fs/promises"
 import type { BridgeConfig } from "~/lib/config"
 import { BridgeNotImplementedError } from "~/lib/error"
 import { runtimeState } from "~/lib/state"
+import { bridgeEventsEnabled, emitBridgeEvent } from "~/lib/events"
+import { observeResponse, type UsageRecord } from "~/lib/usage-telemetry"
 
 const COPILOT_VERSION = "0.26.7"
 const EDITOR_PLUGIN_VERSION = `copilot-chat/${COPILOT_VERSION}`
@@ -132,19 +134,31 @@ export const fetchCopilot = async (
   let lastError: unknown
 
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    let metadata: Pick<UsageRecord, "id" | "timestamp" | "model"> | undefined
     try {
       await traceCopilotRequest(path, init, options, attempt)
+      if (bridgeEventsEnabled() && /^\/(responses|chat\/completions|embeddings|messages)(?:\?|$)/.test(path)) {
+        const body = parseTraceBody(init.body) as { model?: unknown } | undefined
+        metadata = { id: randomUUID(), timestamp: Date.now() / 1000, model: String(body?.model ?? "unknown").slice(0, 128) }
+      }
       const response = await fetch(`${provider.baseUrl}${path}`, {
         ...init,
         headers: buildHeaders(provider, path, init, options),
       })
 
       if (!shouldRetryResponse(response) || attempt === MAX_FETCH_ATTEMPTS) {
-        return response
+        return metadata ? observeResponse(response, metadata, emitBridgeEvent) : response
       }
+      // Retry responses must be accounted for and released even though no downstream
+      // consumer will read their bodies. Never leave an unread tee/stream behind.
+      if (metadata) emitBridgeEvent({ ...metadata, kind: "usage", status: response.status,
+        input: null, output: null, cached: null, outcome: "http_error" })
+      await response.body?.cancel().catch(() => {})
     } catch (error) {
+      if (metadata) emitBridgeEvent({ ...metadata, kind: "usage", status: 0,
+        input: null, output: null, cached: null, outcome: "interrupted" })
       lastError = error
-      if (attempt === MAX_FETCH_ATTEMPTS) {
+      if (init.signal?.aborted || attempt === MAX_FETCH_ATTEMPTS) {
         throw error
       }
     }

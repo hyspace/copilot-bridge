@@ -33,6 +33,7 @@ interface ApplyCodexConfigInput {
   modelReasoningEffort?: string
   /** Optional upstream context window to expose to Codex CLI metadata. */
   modelContextWindow?: number
+  requiresOpenAIAuth?: boolean
 }
 
 interface ApplyResult {
@@ -91,8 +92,8 @@ function buildManagedBlock(input: ApplyCodexConfigInput): string {
   lines.push(`name = "${tomlEscape(settings.providerName)}"`)
   lines.push(`base_url = "${tomlEscape(baseUrl)}"`)
   lines.push(`wire_api = "responses"`)
-  lines.push(`prefer_websockets = false`)
-  lines.push(`requires_openai_auth = false`)
+  lines.push(`supports_websockets = false`)
+  lines.push(`requires_openai_auth = ${input.requiresOpenAIAuth ?? false}`)
   lines.push(END_MARK)
   return lines.join("\n")
 }
@@ -151,7 +152,7 @@ function removeManagedProviderTables(
   const tableHeader = `[model_providers.${providerId}]`
 
   for (let i = 0; i < lines.length;) {
-    if (lines[i].trim() === tableHeader) {
+    if (lines[i].trim().replace(/\s*#.*$/, "") === tableHeader) {
       i += 1
       while (i < lines.length && !/^\s*\[/.test(lines[i])) {
         i += 1
@@ -320,7 +321,18 @@ export async function applyCodexConfig(
   stripped = removeManagedProviderTables(stripped, input.settings.providerId)
   stripped = applyUserScalars(stripped, input)
   stripped = removeManagedTopLevelKeys(stripped, input)
-  const block = buildManagedBlock(input)
+  let preservedAuth: boolean | undefined
+  let inProvider = false
+  for (const line of existing.split("\n")) {
+    if (line.trim().startsWith("[")) {
+      inProvider = line.trim().replace(/\s*#.*$/, "") === `[model_providers.${input.settings.providerId}]`
+    }
+    if (inProvider) {
+      const match = line.match(/^\s*requires_openai_auth\s*=\s*(true|false)\s*(?:#.*)?$/)
+      if (match) preservedAuth = match[1] === "true"
+    }
+  }
+  const block = buildManagedBlock({ ...input, requiresOpenAIAuth: input.requiresOpenAIAuth ?? preservedAuth })
   const { top, rest } = splitTopSection(stripped)
   const parts = [top, block, rest]
     .map((part) => part.replace(/^\n+|\n+$/g, ""))

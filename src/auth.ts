@@ -40,6 +40,7 @@ export const auth = defineCommand({
     const authSession = await setupBridgeAuth(config, {
       force: true,
       showToken: args["show-token"],
+      refresh: false,
     })
 
     if (authSession.githubLogin) {
