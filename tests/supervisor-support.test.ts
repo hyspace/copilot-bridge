@@ -73,14 +73,14 @@ describe("optional native-supervisor support", () => {
     expect(events()[0]).toMatchObject({status:503,outcome:"http_error",input:null,channel:"test-channel"})
     expect(events()[1]).toMatchObject({status:200,outcome:"complete",input:30,output:4,channel:"test-channel"})
   })
-  test("a cancelled request is not retried",async()=>{
+  test("an already cancelled request is never sent or counted as an upstream attempt",async()=>{
     const events=capture()
     const abort=new AbortController();abort.abort()
     let calls=0
     globalThis.fetch=(async()=>{calls++;throw new Error("aborted")}) as unknown as typeof fetch
     await expect(fetchCopilot(provider,"/responses",{signal:abort.signal})).rejects.toThrow("aborted")
-    expect(calls).toBe(1)
-    expect(events()).toHaveLength(1)
+    expect(calls).toBe(0)
+    expect(events()).toHaveLength(0)
   })
   test("Codex setup migrates WebSocket field and preserves explicit OpenAI auth",async()=>{
     const directory=await mkdtemp(join(tmpdir(),"bridge-supervisor-test-"))

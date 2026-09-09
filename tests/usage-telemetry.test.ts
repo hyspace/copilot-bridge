@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { observeResponse, trackedURL, usageFrom, type UsageRecord } from "~/lib/usage-telemetry";
+import { drainRetryResponse, observeResponse, trackedURL, usageFrom, type UsageRecord } from "~/lib/usage-telemetry";
 
 const meta = { id: "one", model: "test", timestamp: 1 };
 const wrap = (text: string, contentType = "text/event-stream", status = 200, chunks = 7) => {
@@ -57,8 +57,76 @@ describe("byte-transparent, bounded telemetry", () => {
     expect(await response.text()).toBe(text);expect(events[0].input).toBe(1);
   });
   test("rejects invalid usage and foreign origins",()=>{
-    expect(usageFrom({usage:{input_tokens:-1,output_tokens:2}})).toBeNull();
+    expect(usageFrom({usage:{input_tokens:-1,output_tokens:2}})).toMatchObject({input:null,output:2,nanoAiu:null});
     expect(trackedURL("https://evil.test/responses","https://api.githubcopilot.com")).toBeFalse();
     expect(trackedURL("https://api.githubcopilot.com/responses","https://api.githubcopilot.com")).toBeTrue();
+  });
+  test("collects request billing independently of missing tokens", async () => {
+    const text = JSON.stringify({usage:{copilot_usage:{total_nano_aiu:1234567890}}});
+    const {response,events} = wrap(text,"application/json");
+    expect(await response.text()).toBe(text);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({input:null,output:null,nanoAiu:1234567890});
+  });
+  test("keeps explicit zero billing distinct from missing or malformed billing", () => {
+    expect(usageFrom({usage:{copilot_usage:{total_nano_aiu:0}}})?.nanoAiu).toBe(0);
+    expect(usageFrom({usage:{copilot_usage:{total_nano_aiu:0.5}}})?.nanoAiu).toBe(0.5);
+    for (const value of [undefined, null, -1, NaN, Infinity, true, "123", Number.MAX_SAFE_INTEGER + 1]) {
+      expect(usageFrom({usage:{input_tokens:2,output_tokens:1,copilot_usage:{total_nano_aiu:value}}}))
+        .toMatchObject({input:2,output:1,nanoAiu:null});
+    }
+  });
+  for (const newline of ["\n","\r\n","\r"]) {
+    test(`merges split token/billing snapshots with ${JSON.stringify(newline)} framing`, async () => {
+      const frames = [
+        {type:"message_start",message:{usage:{input_tokens:12}}},
+        {type:"message_delta",usage:{output_tokens:3,copilot_usage:{total_nano_aiu:1000000000}}},
+        {usage:{copilot_usage:{total_nano_aiu:1250000000}}},
+        {usage:{copilot_usage:{total_nano_aiu:1250000000}}},
+        {type:"message_stop",usage:{output_tokens:4}},
+      ];
+      const text = frames.map(f=>`data: ${JSON.stringify(f)}${newline}${newline}`).join("");
+      const {response,events}=wrap(text,"text/event-stream",200,1);
+      expect(await response.text()).toBe(text);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({input:12,output:4,nanoAiu:1250000000,outcome:"complete"});
+    });
+  }
+  test("captures billing on Responses completion and top-level usage extensions", async () => {
+    const text = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2,"copilot_usage":{"total_nano_aiu":250000000}}}}\n\n';
+    const {response,events}=wrap(text);
+    expect(await response.text()).toBe(text);
+    expect(events[0].nanoAiu).toBe(250000000);
+    expect(usageFrom({usage:{prompt_tokens:3,completion_tokens:2},copilot_usage:{total_nano_aiu:7}})?.nanoAiu).toBe(7);
+  });
+  test("retains observed billing when a stream is interrupted", async () => {
+    const text='data: {"usage":{"copilot_usage":{"total_nano_aiu":500000000}}}\n\n';
+    const {response,events}=wrap(text);
+    await response.text();
+    expect(events[0]).toMatchObject({nanoAiu:500000000,outcome:"interrupted"});
+  });
+  test("retry observation has a deadline and reports only once", async () => {
+    let cancelled = false;
+    const records: UsageRecord[] = [];
+    const response=observeResponse(new Response(new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode('data: {"usage":{"copilot_usage":{"total_nano_aiu":5}}}\n\n')); },
+      cancel() { cancelled=true; },
+    }),{status:503,headers:{"content-type":"text/event-stream"}}),meta,r=>records.push(r));
+    await drainRetryResponse(response,undefined,{timeoutMs:20});
+    expect(cancelled).toBeTrue();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({nanoAiu:5,outcome:"http_error"});
+  });
+  test("retry observation respects its byte cap and cancellation", async () => {
+    let cancelled = false;
+    const records: UsageRecord[] = [];
+    const response=observeResponse(new Response(new ReadableStream<Uint8Array>({
+      pull(c) { c.enqueue(new Uint8Array(64)); },
+      cancel() { cancelled=true; },
+    }),{status:503}),meta,r=>records.push(r));
+    await drainRetryResponse(response,undefined,{maxBytes:64});
+    expect(cancelled).toBeTrue();
+    expect(records).toHaveLength(1);
+    expect(records[0].nanoAiu).toBeNull();
   });
 });

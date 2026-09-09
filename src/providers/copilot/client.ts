@@ -5,7 +5,7 @@ import type { BridgeConfig } from "~/lib/config"
 import { BridgeNotImplementedError } from "~/lib/error"
 import { runtimeState } from "~/lib/state"
 import { bridgeEventsEnabled, emitBridgeEvent } from "~/lib/events"
-import { observeResponse, type UsageRecord } from "~/lib/usage-telemetry"
+import { drainRetryResponse, observeResponse, type UsageRecord } from "~/lib/usage-telemetry"
 
 const COPILOT_VERSION = "0.26.7"
 const EDITOR_PLUGIN_VERSION = `copilot-chat/${COPILOT_VERSION}`
@@ -134,7 +134,14 @@ export const fetchCopilot = async (
   let lastError: unknown
 
   for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    init.signal?.throwIfAborted()
     let metadata: Pick<UsageRecord, "id" | "timestamp" | "model"> | undefined
+    let reported = false
+    const report = (record: UsageRecord) => {
+      if (reported) return
+      reported = true
+      emitBridgeEvent(record)
+    }
     try {
       await traceCopilotRequest(path, init, options, attempt)
       if (bridgeEventsEnabled() && /^\/(responses|chat\/completions|embeddings|messages)(?:\?|$)/.test(path)) {
@@ -147,16 +154,18 @@ export const fetchCopilot = async (
       })
 
       if (!shouldRetryResponse(response) || attempt === MAX_FETCH_ATTEMPTS) {
-        return metadata ? observeResponse(response, metadata, emitBridgeEvent) : response
+        return metadata ? observeResponse(response, metadata, report) : response
       }
       // Retry responses must be accounted for and released even though no downstream
       // consumer will read their bodies. Never leave an unread tee/stream behind.
-      if (metadata) emitBridgeEvent({ ...metadata, kind: "usage", status: response.status,
-        input: null, output: null, cached: null, outcome: "http_error" })
-      await response.body?.cancel().catch(() => {})
+      if (metadata) {
+        await drainRetryResponse(observeResponse(response, metadata, report), init.signal)
+      } else {
+        await response.body?.cancel().catch(() => {})
+      }
     } catch (error) {
-      if (metadata) emitBridgeEvent({ ...metadata, kind: "usage", status: 0,
-        input: null, output: null, cached: null, outcome: "interrupted" })
+      if (metadata && !reported) report({ ...metadata, kind: "usage", status: 0,
+        input: null, output: null, cached: null, nanoAiu: null, outcome: "interrupted" })
       lastError = error
       if (init.signal?.aborted || attempt === MAX_FETCH_ATTEMPTS) {
         throw error
