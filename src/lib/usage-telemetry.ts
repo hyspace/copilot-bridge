@@ -9,7 +9,7 @@ export interface UsageRecord {
   cached: number | null;
   /** Server-reported request charge. One credit is 1,000,000,000 nano-AIU. */
   nanoAiu: number | null;
-  /** False for an incomplete stream/snapshot, even if some counters were observed. */
+  /** False when final token counters were not observed, even if partial counters exist. */
   tokensComplete?: boolean;
   tokenStatus?: "reported" | "partial" | "not_reported" | "interrupted" | "size_limit" | "invalid_json";
   outcome: "complete" | "http_error" | "interrupted";
@@ -104,10 +104,10 @@ export function observeResponse(
     if (emitted) return;
     emitted = true;
     const full = usage?.input != null && usage?.output != null;
-    const tokensComplete = full && completed && !streamFailed && !parseLimited
+    const tokensComplete = full && completed && !parseLimited
       && (!sse || !protocol || finalTokenCounters);
     const tokenStatus: UsageRecord["tokenStatus"] = tokensComplete ? "reported"
-      : parseLimited ? "size_limit" : !completed || streamFailed ? "interrupted"
+      : parseLimited ? "size_limit" : !completed ? "interrupted"
       : usage?.input != null || usage?.output != null ? "partial"
       : malformed ? "invalid_json" : "not_reported";
     report({ ...metadata, kind: "usage", status: response.status,
@@ -125,7 +125,8 @@ export function observeResponse(
         ? { ...value, type } : value, nativeUsage);
       if (type.startsWith("response.")) {
         protocol = "responses";
-        if (type === "response.completed" && next?.input != null && next?.output != null) finalTokenCounters = true;
+        if (["response.completed", "response.incomplete", "response.failed"].includes(type)
+          && next?.input != null && next?.output != null) finalTokenCounters = true;
       } else if (type.startsWith("message_")) {
         protocol = "messages";
         if (type === "message_delta" && next?.output != null) finalTokenCounters = true;
@@ -147,7 +148,7 @@ export function observeResponse(
         };
         if (next.input !== null && next.output !== null) parseLimited = false;
       }
-      if (type === "response.completed" || type === "message_stop") completed = true;
+      if (["response.completed", "response.incomplete", "response.failed", "message_stop"].includes(type)) completed = true;
       if (type === "response.failed" || type === "response.incomplete" || type === "error") streamFailed = true;
     } catch { malformed = true; /* Never change the model response. */ }
   };

@@ -197,6 +197,14 @@ describe("byte-transparent, bounded telemetry", () => {
       expect(events[0]).toMatchObject({input:12,output:0,outcome:"complete",tokensComplete:false,tokenStatus:"partial"});
     }
   });
+  test("failed or length-limited generations can still report complete token consumption", async () => {
+    for (const type of ["response.failed","response.incomplete"]) {
+      const text=`data: ${JSON.stringify({type,response:{usage:{input_tokens:20,output_tokens:7}}})}\n\n`;
+      const {response,events}=wrap(text);
+      await response.text();
+      expect(events[0]).toMatchObject({input:20,output:7,outcome:"interrupted",tokensComplete:true,tokenStatus:"reported"});
+    }
+  });
   test("token field aliases, sibling envelopes and exact total arithmetic", () => {
     expect(usageFrom({response:{usage:null},usage:{prompt_tokens:10,completion_tokens:4,
       cache_read_input_tokens:7}})).toMatchObject({input:10,output:4,cached:7});
