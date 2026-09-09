@@ -91,7 +91,7 @@ function buildManagedBlock(input: ApplyCodexConfigInput): string {
   lines.push(`name = "${tomlEscape(settings.providerName)}"`)
   lines.push(`base_url = "${tomlEscape(baseUrl)}"`)
   lines.push(`wire_api = "responses"`)
-  lines.push(`prefer_websockets = false`)
+  lines.push(`supports_websockets = false`)
   lines.push(`requires_openai_auth = false`)
   lines.push(END_MARK)
   return lines.join("\n")

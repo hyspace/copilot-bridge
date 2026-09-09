@@ -79,7 +79,8 @@ describe("applyCodexConfig", () => {
     expect(content).toContain('model_provider = "bridge"')
     expect(content).toContain("model_supports_reasoning_summaries = true")
     expect(content).toContain("[model_providers.bridge]")
-    expect(content).toContain("prefer_websockets = false")
+    expect(content).toContain("supports_websockets = false")
+    expect(content).not.toContain("prefer_websockets")
     // model is NOT inside the managed block anymore
     const managedStart = content.indexOf(">>> copilot-bridge managed")
     const managedEnd = content.indexOf("<<< copilot-bridge managed")

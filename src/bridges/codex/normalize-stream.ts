@@ -134,21 +134,25 @@ const transformSseChunk = (
   outputItems: Map<number, StableOutputItem>,
 ): string => {
   const lines = chunk.split("\n")
+  const dataIndices: number[] = []
+  const data: string[] = []
+  for (const [index, line] of lines.entries()) {
+    if (line !== "data" && !line.startsWith("data:")) continue
+    dataIndices.push(index)
+    // SSE permits either data:value or data: value; strip at most one space.
+    data.push(line.slice(5).replace(/^ /, ""))
+  }
+  if (!dataIndices.length) return chunk
+  const rawData = data.join("\n")
+  if (!rawData || rawData === "[DONE]") return chunk
+  const normalized = normalizeEventPayload(rawData, stableResponse, outputItems)
+  if (normalized === rawData) return chunk
 
-  return lines
-    .map((line) => {
-      if (!line.startsWith("data: ")) {
-        return line
-      }
-
-      const rawData = line.slice(6)
-      if (!rawData || rawData === "[DONE]") {
-        return line
-      }
-
-      return `data: ${normalizeEventPayload(rawData, stableResponse, outputItems)}`
-    })
-    .join("\n")
+  const dataIndexSet = new Set(dataIndices)
+  return lines.flatMap((line, index) => {
+    if (index === dataIndices[0]) return [`data: ${normalized}`]
+    return dataIndexSet.has(index) ? [] : [line]
+  }).join("\n")
 }
 
 export const normalizeResponsesSseStream = (
@@ -165,45 +169,60 @@ export const normalizeResponsesSseStream = (
 
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
-  let buffer = ""
+  let pendingLine = ""
+  let lines: string[] = []
+  let skipLF = false
 
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const reader = upstreamBody.getReader()
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-
-          if (done) {
-            break
-          }
-
-          buffer += decoder.decode(value, { stream: true })
-
-          let separatorIndex = buffer.indexOf("\n\n")
-
-          while (separatorIndex !== -1) {
-            const rawEvent = buffer.slice(0, separatorIndex)
-            buffer = buffer.slice(separatorIndex + 2)
-
-            const transformed = transformSseChunk(rawEvent, stableResponse, outputItems)
-            controller.enqueue(encoder.encode(`${transformed}\n\n`))
-
-            separatorIndex = buffer.indexOf("\n\n")
-          }
-        }
-
-        if (buffer.length > 0) {
-          const transformed = transformSseChunk(buffer, stableResponse, outputItems)
-          controller.enqueue(encoder.encode(transformed))
-        }
-      } finally {
-        outputItems.clear()
-        reader.releaseLock()
+  const append = (
+    text: string,
+    controller: TransformStreamDefaultController<Uint8Array>,
+  ) => {
+    if (!text) return
+    if (skipLF) {
+      if (text.startsWith("\n")) text = text.slice(1)
+      skipLF = false
+    }
+    const breaks = /[\r\n]/g
+    let start = 0
+    for (let match = breaks.exec(text); match; match = breaks.exec(text)) {
+      const line = pendingLine + text.slice(start, match.index)
+      pendingLine = ""
+      if (line) {
+        lines.push(line)
+      } else {
+        const event = transformSseChunk(lines.join("\n"), stableResponse, outputItems)
+        controller.enqueue(encoder.encode(lines.length ? `${event}\n\n` : "\n"))
+        lines = []
       }
+      start = match.index + 1
+      if (match[0] === "\r") {
+        if (text[start] === "\n") {
+          start++
+          breaks.lastIndex = start
+        } else if (start === text.length) {
+          skipLF = true
+        }
+      }
+    }
+    pendingLine += text.slice(start)
+  }
 
-      controller.close()
+  // pipeThrough propagates upstream read errors, cancellation and backpressure.
+  // A one-chunk queue allows a complete event to arrive before the first read.
+  return upstreamBody.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(value, controller) {
+      append(decoder.decode(value, { stream: true }), controller)
     },
-  })
+    flush(controller) {
+      append(decoder.decode(), controller)
+      if (pendingLine || lines.length) {
+        const trailing = [...lines, pendingLine].join("\n")
+        controller.enqueue(encoder.encode(
+          transformSseChunk(trailing, stableResponse, outputItems),
+        ))
+      }
+      outputItems.clear()
+      // Never synthesize response.completed for a truncated or failed stream.
+    },
+  }, undefined, { highWaterMark: 1 }))
 }
