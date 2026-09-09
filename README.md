@@ -365,7 +365,6 @@ default CLI behavior:
 
 | Variable | Behavior |
 | --- | --- |
-| `COPILOT_BRIDGE_ACCESS_KEY` | Require an exact `X-Bridge-Key` on all inbound routes, including `/usage` and `/healthz`. Use for trusted-LAN access; plain HTTP is still not encrypted. |
 | `COPILOT_BRIDGE_INSTANCE_ID` | Add the supplied instance identifier to `/healthz` so a supervisor can verify process ownership. |
 | `COPILOT_BRIDGE_EVENTS_TOKEN` | Enable `@@CBM:` JSONL metadata events on stdout, carrying this per-launch channel token. No prompts, model output or authentication credentials are included. Keep the channel token private and use a fresh value per launch. |
 
@@ -384,6 +383,10 @@ Codex setup writes `supports_websockets = false` (not `prefer_websockets`) and
 preserves an existing explicit `requires_openai_auth` choice.
 Native builds can define `__BRIDGE_VERSION__` at bundle time; ordinary CLI runs
 continue to read the package version normally.
+
+Inbound API requests do not require a bridge access key. Binding to a LAN
+interface permits devices on that network to use the service; use trusted
+networks only and do not expose this unencrypted listener to the Internet.
 
 ## Acknowledgements
 

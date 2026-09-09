@@ -40,25 +40,23 @@ const capture = () => {
 }
 
 describe("optional native-supervisor support", () => {
-  test("no access key keeps ordinary health response backward compatible",async()=>{
+  test("ordinary health response stays backward compatible",async()=>{
     delete process.env.COPILOT_BRIDGE_ACCESS_KEY
     delete process.env.COPILOT_BRIDGE_INSTANCE_ID
     expect(await (await createServer(config).request("/healthz")).json()).toEqual({ok:true})
   })
-  test("LAN key protects every route including health and usage",async()=>{
-    process.env.COPILOT_BRIDGE_ACCESS_KEY="test-key"
+  test("instance health works without a LAN key, even with a stale key environment variable",async()=>{
+    process.env.COPILOT_BRIDGE_ACCESS_KEY="obsolete-setting"
     process.env.COPILOT_BRIDGE_INSTANCE_ID="test-instance"
     const app=createServer(config)
-    expect((await app.request("/healthz")).status).toBe(401)
-    expect((await app.request("/usage",{headers:{"X-Bridge-Key":"wrong"}})).status).toBe(401)
-    const good=await app.request("/healthz",{headers:{"X-Bridge-Key":"test-key"}})
+    const good=await app.request("/healthz")
     expect(good.status).toBe(200)
     expect(await good.json()).toEqual({ok:true,instance:"test-instance"})
   })
   test("usage observation is opt-in and returns the original response when disabled",async()=>{
     delete process.env.COPILOT_BRIDGE_EVENTS_TOKEN
     const original=Response.json({usage:{input_tokens:3,output_tokens:2}})
-    globalThis.fetch=(async()=>original) as typeof fetch
+    globalThis.fetch=(async()=>original) as unknown as typeof fetch
     expect(await fetchCopilot(provider,"/responses",{method:"POST",body:'{"model":"test"}'})).toBe(original)
   })
   test("counts final usage and each discarded retry, then cancels discarded body",async()=>{
@@ -67,7 +65,7 @@ describe("optional native-supervisor support", () => {
     globalThis.fetch=(async()=>{
       if (++calls===1) return new Response(new ReadableStream({cancel(){cancelled=true}}),{status:503})
       return Response.json({usage:{input_tokens:30,output_tokens:4}})
-    }) as typeof fetch
+    }) as unknown as typeof fetch
     const response=await fetchCopilot(provider,"/responses",{method:"POST",body:'{"model":"test"}'})
     await response.text()
     expect(cancelled).toBeTrue()
@@ -79,7 +77,7 @@ describe("optional native-supervisor support", () => {
     const events=capture()
     const abort=new AbortController();abort.abort()
     let calls=0
-    globalThis.fetch=(async()=>{calls++;throw new Error("aborted")}) as typeof fetch
+    globalThis.fetch=(async()=>{calls++;throw new Error("aborted")}) as unknown as typeof fetch
     await expect(fetchCopilot(provider,"/responses",{signal:abort.signal})).rejects.toThrow("aborted")
     expect(calls).toBe(1)
     expect(events()).toHaveLength(1)

@@ -1,6 +1,5 @@
 import { describe, test, expect } from "bun:test";
 import { observeResponse, trackedURL, usageFrom, type UsageRecord } from "~/lib/usage-telemetry";
-import { validBridgeKey } from "~/lib/access-key";
 
 const meta = { id: "one", model: "test", timestamp: 1 };
 const wrap = (text: string, contentType = "text/event-stream", status = 200, chunks = 7) => {
@@ -47,10 +46,5 @@ describe("byte-transparent, bounded telemetry", () => {
     expect(usageFrom({usage:{input_tokens:-1,output_tokens:2}})).toBeNull();
     expect(trackedURL("https://evil.test/responses","https://api.githubcopilot.com")).toBeFalse();
     expect(trackedURL("https://api.githubcopilot.com/responses","https://api.githubcopilot.com")).toBeTrue();
-  });
-  test("LAN key requires exact constant-time equality",()=>{
-    expect(validBridgeKey("abc","abc")).toBeTrue();
-    expect(validBridgeKey("abcd","abc")).toBeFalse();
-    expect(validBridgeKey(undefined,"abc")).toBeFalse();
   });
 });

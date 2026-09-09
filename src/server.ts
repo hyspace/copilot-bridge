@@ -4,7 +4,6 @@ import { cors } from "hono/cors"
 import { logger } from "hono/logger"
 
 import type { BridgeConfig, BridgeEnv } from "~/lib/config"
-import { validBridgeKey } from "~/lib/access-key"
 import { emitBridgeEvent } from "~/lib/events"
 import { chatCompletionRoutes } from "~/routes/chat-completions"
 import { embeddingRoutes } from "~/routes/embeddings"
@@ -15,13 +14,6 @@ import { usageRoutes } from "~/routes/usage"
 
 export const createServer = (config: BridgeConfig) => {
   const app = new Hono<BridgeEnv>()
-  const accessKey = process.env.COPILOT_BRIDGE_ACCESS_KEY
-  app.use("*", async (c, next) => {
-    if (accessKey && !validBridgeKey(c.req.header("x-bridge-key"), accessKey)) {
-      return c.json({ error: { message: "Missing or invalid X-Bridge-Key" } }, 401)
-    }
-    await next()
-  })
 
   app.use(logger())
   app.use("*", cors())
