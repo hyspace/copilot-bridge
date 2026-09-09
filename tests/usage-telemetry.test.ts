@@ -186,6 +186,17 @@ describe("byte-transparent, bounded telemetry", () => {
     await response.text();
     expect(events[0]).toMatchObject({input:12,output:0,tokensComplete:false,tokenStatus:"interrupted"});
   });
+  test("initial placeholder usage does not become complete just because the stream stops", async () => {
+    for (const frames of [
+      [{type:"response.created",response:{usage:{input_tokens:12,output_tokens:0}}},{type:"response.completed"}],
+      [{choices:[{delta:{}}],usage:{prompt_tokens:12,completion_tokens:0}},{choices:[{finish_reason:"stop"}]}],
+      [{type:"message_start",message:{usage:{input_tokens:12,output_tokens:0}}},{type:"message_stop"}],
+    ]) {
+      const {response,events}=wrap(frames.map(v=>`data: ${JSON.stringify(v)}\n\n`).join("")+"data: [DONE]\n\n");
+      await response.text();
+      expect(events[0]).toMatchObject({input:12,output:0,outcome:"complete",tokensComplete:false,tokenStatus:"partial"});
+    }
+  });
   test("token field aliases, sibling envelopes and exact total arithmetic", () => {
     expect(usageFrom({response:{usage:null},usage:{prompt_tokens:10,completion_tokens:4,
       cache_read_input_tokens:7}})).toMatchObject({input:10,output:4,cached:7});

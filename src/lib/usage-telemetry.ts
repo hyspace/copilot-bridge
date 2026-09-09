@@ -95,6 +95,8 @@ export function observeResponse(
   let pendingLine = "", lineHasContent = false, skipLF = false, frameSize = 0;
   let dataLines: string[] = [];
   let eventName = "", parseLimited = false, malformed = false;
+  let protocol: "responses" | "messages" | "chat" | undefined;
+  let finalTokenCounters = false;
   let usage: ReturnType<typeof usageFrom> = null;
   const nativeUsage: NativeUsageState = {};
   const decoder = new TextDecoder();
@@ -102,7 +104,8 @@ export function observeResponse(
     if (emitted) return;
     emitted = true;
     const full = usage?.input != null && usage?.output != null;
-    const tokensComplete = full && completed && !streamFailed && !parseLimited;
+    const tokensComplete = full && completed && !streamFailed && !parseLimited
+      && (!sse || !protocol || finalTokenCounters);
     const tokenStatus: UsageRecord["tokenStatus"] = tokensComplete ? "reported"
       : parseLimited ? "size_limit" : !completed || streamFailed ? "interrupted"
       : usage?.input != null || usage?.output != null ? "partial"
@@ -120,6 +123,19 @@ export function observeResponse(
       const type = typeof value?.type === "string" ? value.type : eventName;
       const next = usageFrom(value && typeof value === "object" && !Array.isArray(value)
         ? { ...value, type } : value, nativeUsage);
+      if (type.startsWith("response.")) {
+        protocol = "responses";
+        if (type === "response.completed" && next?.input != null && next?.output != null) finalTokenCounters = true;
+      } else if (type.startsWith("message_")) {
+        protocol = "messages";
+        if (type === "message_delta" && next?.output != null) finalTokenCounters = true;
+      } else if (Array.isArray(value?.choices)) {
+        protocol = "chat";
+        if (next?.input != null && next?.output != null
+          && (value.choices.length === 0 || value.choices.some((choice: any) => choice?.finish_reason != null))) {
+          finalTokenCounters = true;
+        }
+      }
       if (next) {
         // These are request-level snapshots, not per-frame charges. Never add
         // repeated/cumulative SSE counters or erase a field absent in a later frame.
