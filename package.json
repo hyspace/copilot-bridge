@@ -36,6 +36,7 @@
     "prepack": "bun run build",
     "start": "NODE_ENV=production bun run ./src/main.ts",
     "test": "bun test",
+    "test:http": "bun run scripts/test-protocol-http.ts",
     "typecheck": "tsc"
   },
   "dependencies": {

@@ -45,6 +45,10 @@ export function observeResponse(
   let overflow = false;
   let emitted = false;
   let completed = !sse;
+  let streamFailed = false;
+  let stopped = false;
+  let pendingLine = "", lineHasContent = false, skipLF = false, frameSize = 0;
+  let dataLines: string[] = [];
   let usage: ReturnType<typeof usageFrom> = null;
   const decoder = new TextDecoder();
   const emit = (interrupted = false) => {
@@ -52,7 +56,7 @@ export function observeResponse(
     emitted = true;
     report({ ...metadata, kind: "usage", status: response.status,
       input: usage?.input ?? null, output: usage?.output ?? null, cached: usage?.cached ?? null,
-      outcome: !response.ok ? "http_error" : interrupted || !completed ? "interrupted" : "complete" });
+      outcome: !response.ok ? "http_error" : interrupted || !completed || streamFailed ? "interrupted" : "complete" });
   };
   const parse = (data: string) => {
     if (data === "[DONE]") { completed = true; return; }
@@ -60,8 +64,22 @@ export function observeResponse(
       const value = JSON.parse(data);
       usage = usageFrom(value) ?? usage;
       if (value.type === "response.completed" || value.type === "message_stop") completed = true;
-      if (value.type === "response.failed" || value.type === "error") completed = false;
+      if (value.type === "response.failed" || value.type === "error") streamFailed = true;
     } catch { /* A malformed event must not change the model response. */ }
+  };
+  const dispatchEvent = () => {
+    if (!overflow && dataLines.length) {
+      const data = dataLines.join("\n");
+      if (data) parse(data);
+    }
+    dataLines = []; frameSize = 0; overflow = false;
+  };
+  const finishLine = () => {
+    if (!lineHasContent) dispatchEvent();
+    else if (!overflow && (pendingLine === "data" || pendingLine.startsWith("data:"))) {
+      dataLines.push(pendingLine.slice(5).replace(/^ /, ""));
+    }
+    pendingLine = ""; lineHasContent = false;
   };
   const accept = (text: string) => {
     if (!sse) {
@@ -70,33 +88,37 @@ export function observeResponse(
       else buffer += text;
       return;
     }
-    // Process incrementally, even if the transport delivers one unusually large chunk.
-    for (const piece of text.split(/(\n)/)) {
-      buffer += piece;
-      if (buffer.length > MAX_EVENT) { buffer = ""; overflow = true; }
-      if (/\r?\n\r?\n$/.test(buffer)) {
-        if (!overflow) {
-          const data = buffer.split(/\r?\n/)
-            .filter(line => line.startsWith("data:"))
-            .map(line => line.slice(5).replace(/^ /, "")).join("\n");
-          if (data) parse(data);
-        }
-        buffer = ""; overflow = false;
+    // LF, CRLF and bare CR must match the protocol normalizer, including byte-split chunks.
+    for (const character of text) {
+      if (skipLF) { skipLF = false; if (character === "\n") continue; }
+      if (character === "\r" || character === "\n") {
+        finishLine(); skipLF = character === "\r"; continue;
       }
+      lineHasContent = true;
+      frameSize += character.length;
+      if (frameSize > MAX_EVENT) { overflow = true; pendingLine = ""; dataLines = []; }
+      else if (!overflow) pendingLine += character;
     }
   };
   const reader = response.body.getReader();
   let released = false;
-  const release = () => { if (!released) { released = true; reader.releaseLock(); } };
+  const release = () => {
+    if (!released) {
+      released = true; buffer = ""; pendingLine = ""; dataLines = []; reader.releaseLock();
+    }
+  };
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const next = await reader.read();
+        if (stopped) return;
         if (next.done) {
           accept(decoder.decode());
           if (!sse && !overflow) parse(buffer);
+          if (sse) { if (lineHasContent) finishLine(); dispatchEvent(); }
           buffer = "";
           emit();
+          stopped = true;
           release();
           controller.close();
         } else {
@@ -104,11 +126,11 @@ export function observeResponse(
           controller.enqueue(next.value);
         }
       } catch (error) {
-        buffer = ""; emit(true); release(); controller.error(error);
+        if (!stopped) { stopped = true; emit(true); release(); controller.error(error); }
       }
     },
     async cancel(reason) {
-      buffer = ""; emit(true);
+      stopped = true; emit(true);
       try { await reader.cancel(reason); } finally { release(); }
     }
   });

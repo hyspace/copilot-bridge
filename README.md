@@ -96,7 +96,7 @@ model_supports_reasoning_summaries = true
 name = "Copilot Bridge"
 base_url = "http://127.0.0.1:4142/v1"
 wire_api = "responses"
-prefer_websockets = false
+supports_websockets = false
 requires_openai_auth = false
 # <<< copilot-bridge managed block — edits outside this block are preserved <<<
 ```
@@ -257,6 +257,37 @@ Diagnostics:
 - Does not include: request messages, prompt text, bearer tokens, tool descriptions, or the full request body.
 
 **Review or redact debug logs before sharing them publicly.**
+
+### Codex HTTP compatibility
+
+`POST /v1/responses` accepts plain JSON or HTTP `Content-Encoding` values
+`gzip`, `deflate`, `br`, and `zstd`. Encodings are decoded before JSON parsing,
+in reverse order for stacked encodings (at most four layers). Zstd requires
+runtime support in `node:zlib`; older runtimes reject that encoding with 415
+instead of failing to start the bridge. The wire body and each decoded layer
+are limited to 64 MiB. This is a memory/transport limit, not a token limit.
+Malformed compressed data or JSON returns a structured 400, oversized bodies
+return 413, and unsupported encodings return 415. Errors never echo request
+contents. Client authentication headers are not forwarded to Copilot.
+
+The native Responses SSE normalizer accepts LF, CRLF, and CR line endings,
+optional whitespace after `data:`, and multiline data fields. It preserves
+Unicode text, private-use citation markers, source metadata and annotations;
+it does not invent source URLs or synthesize completion after a truncated
+stream. Rebuilt SSE responses drop obsolete body-length, encoding and integrity
+headers, while retaining request IDs and retry headers. Cancellation and
+upstream stream errors propagate through the normalizer.
+
+This is **not** an implementation of Codex's standalone `/alpha/search` API or
+of a citation renderer. The bridge's configured `web_search_backend` implements
+search inside Responses requests; it is not the standalone Alpha Search protocol.
+Native source/annotation preservation does not guarantee that every Codex UI
+will render every citation marker. Missing sources must be diagnosed upstream,
+not replaced with guessed links.
+
+For protocol regression tests, run `bun test`. Run `bun run test:http` for an
+additional HTTP smoke test using two ephemeral loopback servers and fake tokens
+(no real model calls and no changes to user configuration).
 
 ## Environment overrides
 

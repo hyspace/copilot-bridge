@@ -12,6 +12,20 @@ const wrap = (text: string, contentType = "text/event-stream", status = 200, chu
   return {response,events};
 };
 describe("byte-transparent, bounded telemetry", () => {
+  for (const newline of ["\n", "\r\n", "\r"]) {
+    test(`observes usage over ${JSON.stringify(newline)} framing without rewriting bytes`, async () => {
+      const text = 'data:{"type":"response.completed",' + newline
+        + 'data:"response":{"usage":{"input_tokens":7,"output_tokens":2}}}' + newline + newline;
+      const {response,events} = wrap(text,"text/event-stream",200,1);
+      expect(await response.text()).toBe(text);
+      expect(events[0]).toMatchObject({input:7,output:2,outcome:"complete"});
+    });
+  }
+  test("a failed event followed by DONE is not successful",async()=>{
+    const {response,events}=wrap('data: {"type":"response.failed"}\n\ndata: [DONE]\n\n');
+    await response.text();
+    expect(events[0].outcome).toBe("interrupted");
+  });
   test("preserves SSE bytes, CRLF, UTF-8 and counts usage once", async () => {
     const text = 'data: {"type":"response.output_text.delta","delta":"你好"}\r\n\r\n'
       + 'data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}}\r\n\r\n'

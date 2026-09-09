@@ -1,5 +1,3 @@
-import { mapSSE } from "~/lib/sse-stream"
-
 interface ResponseMetadata {
   created_at?: number
   id?: string
@@ -136,27 +134,135 @@ const transformSseChunk = (
   outputItems: Map<number, StableOutputItem>,
 ): string => {
   const lines = chunk.split("\n")
+  const dataIndices: number[] = []
+  const data: string[] = []
+  for (const [index, line] of lines.entries()) {
+    if (line !== "data" && !line.startsWith("data:")) continue
+    dataIndices.push(index)
+    // SSE permits either data:value or data: value; strip at most one space.
+    data.push(line.slice(5).replace(/^ /, ""))
+  }
+  if (!dataIndices.length) return chunk
+  const rawData = data.join("\n")
+  if (!rawData || rawData === "[DONE]") return chunk
+  const normalized = normalizeEventPayload(rawData, stableResponse, outputItems)
+  if (normalized === rawData) return chunk
 
-  return lines
-    .map((line) => {
-      if (!line.startsWith("data: ")) {
-        return line
-      }
-
-      const rawData = line.slice(6)
-      if (!rawData || rawData === "[DONE]") {
-        return line
-      }
-
-      return `data: ${normalizeEventPayload(rawData, stableResponse, outputItems)}`
-    })
-    .join("\n")
+  const dataIndexSet = new Set(dataIndices)
+  return lines.flatMap((line, index) => {
+    if (index === dataIndices[0]) return [`data: ${normalized}`]
+    return dataIndexSet.has(index) ? [] : [line]
+  }).join("\n")
 }
 
-export const normalizeResponsesSseStream = (upstreamBody: ReadableStream<Uint8Array>) => {
-  const stableResponse: StableResponseMetadata = { created_at: 0, id: "", initialized: false, model: "" }
+export const normalizeResponsesSseStream = (
+  upstreamBody: ReadableStream<Uint8Array>,
+) => {
+  const stableResponse: StableResponseMetadata = {
+    created_at: 0,
+    id: "",
+    initialized: false,
+    model: "",
+  }
+  // Per stream, O(output items), not O(tokens); no cross-request ID aliases.
   const outputItems = new Map<number, StableOutputItem>()
-  return mapSSE(upstreamBody,
-    (frame) => transformSseChunk(frame, stableResponse, outputItems),
-    () => outputItems.clear())
+
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let pendingLine = ""
+  let lines: string[] = []
+  let skipLF = false
+  let frameCharacters = 0
+  const maxFrameCharacters = 8 * 1024 * 1024
+  const checkSize = (additional: number) => {
+    if (frameCharacters + pendingLine.length + additional > maxFrameCharacters) {
+      throw new Error("Upstream SSE frame exceeds the 8 MiB character limit")
+    }
+  }
+  const cleanup = () => {
+    pendingLine = ""
+    lines = []
+    frameCharacters = 0
+    outputItems.clear()
+  }
+
+  const append = (
+    text: string,
+    controller: TransformStreamDefaultController<Uint8Array>,
+  ) => {
+    if (!text) return
+    if (skipLF) {
+      if (text.startsWith("\n")) text = text.slice(1)
+      skipLF = false
+    }
+    const breaks = /[\r\n]/g
+    let start = 0
+    for (let match = breaks.exec(text); match; match = breaks.exec(text)) {
+      checkSize(match.index - start)
+      const line = pendingLine + text.slice(start, match.index)
+      pendingLine = ""
+      if (line) {
+        lines.push(line)
+        frameCharacters += line.length + 1
+      } else {
+        const event = transformSseChunk(lines.join("\n"), stableResponse, outputItems)
+        controller.enqueue(encoder.encode(lines.length ? `${event}\n\n` : "\n"))
+        lines = []
+        frameCharacters = 0
+      }
+      start = match.index + 1
+      if (match[0] === "\r") {
+        if (text[start] === "\n") {
+          start++
+          breaks.lastIndex = start
+        } else if (start === text.length) {
+          skipLF = true
+        }
+      }
+    }
+    checkSize(text.length - start)
+    pendingLine += text.slice(start)
+  }
+
+  // pipeThrough propagates upstream read errors, cancellation and backpressure.
+  // A one-chunk queue allows a complete event to arrive before the first read.
+  const transformed = upstreamBody.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(value, controller) {
+      append(decoder.decode(value, { stream: true }), controller)
+    },
+    flush(controller) {
+      append(decoder.decode(), controller)
+      if (pendingLine || lines.length) {
+        const trailing = [...lines, pendingLine].join("\n")
+        controller.enqueue(encoder.encode(
+          transformSseChunk(trailing, stableResponse, outputItems),
+        ))
+      }
+      outputItems.clear()
+      // Never synthesize response.completed for a truncated or failed stream.
+    },
+  }, undefined, { highWaterMark: 1 }))
+  // Release retained frame/ID state on cancellation and errors as well as EOF.
+  const reader = transformed.getReader()
+  let stopped = false
+  let released = false
+  const release = () => {
+    if (!released) { released = true; cleanup(); reader.releaseLock() }
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read()
+        if (stopped) return
+        if (next.done) { stopped = true; release(); controller.close() }
+        else controller.enqueue(next.value)
+      } catch (error) {
+        if (!stopped) { stopped = true; release(); controller.error(error) }
+      }
+    },
+    async cancel(reason) {
+      stopped = true
+      try { await reader.cancel(reason) } finally { release() }
+    },
+  })
 }

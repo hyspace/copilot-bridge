@@ -35,6 +35,8 @@ import { BridgeNotImplementedError } from "~/lib/error"
 import { getModelCapability } from "~/lib/model-capabilities"
 import { checkRateLimit, RateLimitError } from "~/lib/rate-limit"
 import { runtimeState } from "~/lib/state"
+import { readJsonRequest, RequestBodyError } from "~/lib/request-body"
+import { rebuiltResponseHeaders } from "~/lib/response-headers"
 import {
   summarizeToolsForDiagnostics,
   type ToolDiagnostics,
@@ -364,7 +366,22 @@ responsesRoutes.post("/", async (c) => {
     }
     throw error
   }
-  const rawPayload = (await c.req.json()) as ResponsesRequestLike
+  let rawPayload: ResponsesRequestLike
+  try {
+    const parsed = await readJsonRequest(c.req.raw)
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new RequestBodyError(400, "Request body must be a JSON object.")
+    }
+    rawPayload = parsed as ResponsesRequestLike
+  } catch (error) {
+    if (error instanceof RequestBodyError) {
+      return c.json(
+        { error: { type: "invalid_request_error", message: error.message } },
+        error.status,
+      )
+    }
+    throw error
+  }
   const effectiveRawPayload =
     runtimeState.modelOverride ?
       { ...rawPayload, model: runtimeState.modelOverride }
@@ -637,18 +654,15 @@ responsesRoutes.post("/", async (c) => {
     }
 
     if (payload.stream && upstream.body && contentType.includes("text/event-stream")) {
-      const headers = new Headers(upstream.headers)
-      headers.delete("content-length")
-      headers.delete("content-encoding")
       return new Response(normalizeResponsesSseStream(upstream.body), {
         status: upstream.status,
-        headers,
+        headers: rebuiltResponseHeaders(upstream.headers),
       })
     }
 
     return new Response(upstream.body, {
       status: upstream.status,
-      headers: upstream.headers,
+      headers: rebuiltResponseHeaders(upstream.headers),
     })
   } catch (error) {
     if (error instanceof BridgeNotImplementedError) {
