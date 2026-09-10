@@ -70,7 +70,7 @@ export const gateway = defineCommand({
     })
     const timer = setInterval(() => { void refresh() }, 30_000)
     timer.unref()
-    const shutdown = () => { clearInterval(timer); auth.cancel(); store.close(); server.close(); setTimeout(() => process.exit(0), 5000).unref() }
+    const shutdown = () => { clearInterval(timer); auth.cancel(true); store.close(); server.close(); setTimeout(() => process.exit(0), 5000).unref() }
     process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown)
     // Listen before any optional account/network dependency. Local must not
     // become unavailable because a cloud account is disconnected.

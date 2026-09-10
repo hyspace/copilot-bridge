@@ -74,6 +74,32 @@ describe("independent Codex OAuth orchestration", () => {
     expect(auth.snapshot().state).toBe("connected"); expect(changed).toBe(1)
     expect(JSON.stringify(auth.snapshot())).not.toContain("private-")
   })
+  test("Cancel is explicitly refused once the atomic Keychain commit has started", async () => {
+    const store = new MemorySecrets()
+    let started!: () => void, finish!: () => void
+    const entered = new Promise<void>(r => { started = r })
+    const gate = new Promise<void>(r => { finish = r })
+    store.write = async (_key, value) => { started(); await gate; store.value = value }
+    const auth = new CodexAuth(store, oauth())
+    auth.start(); await entered
+    expect(auth.snapshot().canCancel).toBe(false)
+    expect(() => auth.cancel()).toThrow("already being saved")
+    finish(); await Bun.sleep(5)
+    expect(auth.snapshot().state).toBe("connected")
+  })
+  test("Disconnect during a login commit waits for it and cannot resurrect that account", async () => {
+    const store = new MemorySecrets()
+    let started!: () => void, finish!: () => void
+    const entered = new Promise<void>(r => { started = r })
+    const gate = new Promise<void>(r => { finish = r })
+    store.write = async (_key, value) => { started(); await gate; store.value = value }
+    const auth = new CodexAuth(store, oauth())
+    auth.start(); await entered
+    const logout = auth.logout()
+    finish(); await logout; await Bun.sleep(5)
+    expect(auth.snapshot().state).toBe("disconnected")
+    expect(store.value).toBeUndefined()
+  })
 })
 
 function fakeProvider(id: ProviderID, calls: Array<{ provider: string; model: string }>): ProviderAdapter {

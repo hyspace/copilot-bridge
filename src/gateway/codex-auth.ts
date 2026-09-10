@@ -12,6 +12,7 @@ export interface CodexLoginState {
   url?: string
   code?: string
   awaitingCode?: boolean
+  canCancel?: boolean
   accountFingerprint?: string
   accountLabel?: string
 }
@@ -34,13 +35,16 @@ export class CodexAuth {
   private active?: AbortController
   private answer?: { resolve(value: string): void; reject(error: Error): void }
   private generation = 0
+  private committing = false
   private store: SecretStore
   private oauth: OAuthAuth
   onChange?: () => void
   constructor(store: SecretStore, oauth: OAuthAuth = openaiCodexProvider().auth.oauth!) {
     this.store = store; this.oauth = oauth
   }
-  snapshot(): CodexLoginState { return { ...this.loginState } }
+  snapshot(): CodexLoginState {
+    return { ...this.loginState, ...(this.loginState.state === "signing-in" ? { canCancel: !this.committing } : {}) }
+  }
   private connected(value: OAuthCredential): void {
     this.loginState = {
       state: "connected", accountFingerprint: accountFingerprint(value),
@@ -131,10 +135,18 @@ export class CodexAuth {
     }).then(value => this.exclusive(async () => {
       if (controller.signal.aborted || generation !== this.generation) return
       const valid = credential(value)!
-      await this.store.write("codex", valid)
-      this.connected(valid)
-      this.loginState.message = "Codex account connected independently of Codex App."
-      this.onChange?.()
+      // Keychain writes cannot be cancelled atomically. Once committing starts,
+      // reject a user Cancel with 409 rather than claiming cancellation and then
+      // unexpectedly saving that account. Logout still queues removal after it.
+      this.committing = true
+      this.loginState.message = "Finishing secure sign-in…"
+      try {
+        await this.store.write("codex", valid)
+        if (controller.signal.aborted || generation !== this.generation) return
+        this.connected(valid)
+        this.loginState.message = "Codex account connected independently of Codex App."
+        this.onChange?.()
+      } finally { this.committing = false }
     })).catch(() => {
       if (!controller.signal.aborted && generation === this.generation)
         this.loginState = { state: "error", message: "Codex sign-in failed. Retry or use device-code sign-in." }
@@ -147,14 +159,16 @@ export class CodexAuth {
       throw new GatewayError(409, "no_login_prompt", "No authorization callback is pending.")
     this.answer.resolve(value)
   }
-  cancel(): void {
+  cancel(force = false): void {
+    if (this.committing && !force)
+      throw new GatewayError(409, "login_commit_in_progress", "Secure sign-in is already being saved. Wait for completion, then Disconnect if needed.")
     ++this.generation
     this.active?.abort(); this.active = undefined
     this.answer?.reject(new Error("Cancelled")); this.answer = undefined
     if (this.loginState.state === "signing-in") this.loginState = { state: "disconnected", message: "Sign-in cancelled." }
   }
   async logout(): Promise<void> {
-    this.cancel()
+    this.cancel(true)
     await this.exclusive(() => this.store.remove("codex"))
     this.loginState = { state: "disconnected" }
   }
