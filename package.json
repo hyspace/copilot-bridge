@@ -1,7 +1,7 @@
 {
   "name": "betahi-copilot-bridge",
   "version": "0.20.19",
-  "description": "Model-layer bridge for routing Codex CLI, Claude Code, and similar clients to GitHub Copilot.",
+  "description": "Codex App model gateway for Codex subscription, GitHub Copilot and local Unsloth Studio.",
   "keywords": [
     "github-copilot",
     "proxy",
@@ -40,6 +40,7 @@
     "typecheck": "tsc"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
     "@hono/node-server": "^1.14.4",
     "citty": "^0.1.6",
     "consola": "^3.4.2",

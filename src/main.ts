@@ -4,14 +4,15 @@ import { defineCommand, runMain } from "citty"
 
 import { auth } from "./auth"
 import { start } from "./start"
+import { gateway } from "./gateway/main"
 
 const main = defineCommand({
   meta: {
     name: "copilot-bridge",
     description:
-      "Model-layer bridge for routing Codex CLI, Claude Code, and similar clients to GitHub Copilot.",
+      "Codex App model gateway for Codex subscription, GitHub Copilot and local Unsloth Studio.",
   },
-  subCommands: { auth, start },
+  subCommands: { auth, start, gateway },
 })
 
 await runMain(main)

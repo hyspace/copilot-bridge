@@ -3,6 +3,8 @@ export interface UsageRecord {
   id: string;
   timestamp: number;
   model: string;
+  /** Source of this attempt; older Copilot-only producers omit it. */
+  provider?: "codex" | "copilot" | "local";
   status: number;
   input: number | null;
   output: number | null;
@@ -75,7 +77,7 @@ export function usageFrom(value: any, nativeState: NativeUsageState = {}) {
 /** Observation only: each original byte is forwarded unchanged. No tee/read-ahead branch. */
 export function observeResponse(
   response: Response,
-  metadata: Pick<UsageRecord, "id" | "timestamp" | "model">,
+  metadata: Pick<UsageRecord, "id" | "timestamp" | "model" | "provider">,
   report: (record: UsageRecord) => void,
 ): Response {
   if (!response.body) {

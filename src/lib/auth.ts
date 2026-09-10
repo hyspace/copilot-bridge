@@ -45,6 +45,8 @@ interface AuthOptions {
   force?: boolean
   showToken?: boolean
   refresh?: boolean
+  /** A multi-provider gateway must not block other sources on interactive login. */
+  prompt?: boolean
 }
 
 export interface BridgeAuthSession {
@@ -182,6 +184,10 @@ const ensureGitHubToken = async (options: AuthOptions = {}) => {
   const existingToken = options.force ? "" : await readGitHubToken()
   if (existingToken) {
     return existingToken
+  }
+
+  if (options.prompt === false) {
+    throw new Error("GitHub sign-in is required.")
   }
 
   const deviceCode = await getDeviceCode()

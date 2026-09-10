@@ -132,6 +132,7 @@ const transformSseChunk = (
   chunk: string,
   stableResponse: StableResponseMetadata,
   outputItems: Map<number, StableOutputItem>,
+  mapData?: (data: string) => string,
 ): string => {
   const lines = chunk.split("\n")
   const dataIndices: number[] = []
@@ -145,7 +146,7 @@ const transformSseChunk = (
   if (!dataIndices.length) return chunk
   const rawData = data.join("\n")
   if (!rawData || rawData === "[DONE]") return chunk
-  const normalized = normalizeEventPayload(rawData, stableResponse, outputItems)
+  const normalized = mapData ? mapData(rawData) : normalizeEventPayload(rawData, stableResponse, outputItems)
   if (normalized === rawData) return chunk
 
   const dataIndexSet = new Set(dataIndices)
@@ -157,6 +158,8 @@ const transformSseChunk = (
 
 export const normalizeResponsesSseStream = (
   upstreamBody: ReadableStream<Uint8Array>,
+  /** Reuse bounded framing without applying the Copilot-only identity fix. */
+  mapData?: (data: string) => string,
 ) => {
   const stableResponse: StableResponseMetadata = {
     created_at: 0,
@@ -205,7 +208,7 @@ export const normalizeResponsesSseStream = (
         lines.push(line)
         frameCharacters += line.length + 1
       } else {
-        const event = transformSseChunk(lines.join("\n"), stableResponse, outputItems)
+        const event = transformSseChunk(lines.join("\n"), stableResponse, outputItems, mapData)
         controller.enqueue(encoder.encode(lines.length ? `${event}\n\n` : "\n"))
         lines = []
         frameCharacters = 0
@@ -235,7 +238,7 @@ export const normalizeResponsesSseStream = (
       if (pendingLine || lines.length) {
         const trailing = [...lines, pendingLine].join("\n")
         controller.enqueue(encoder.encode(
-          transformSseChunk(trailing, stableResponse, outputItems),
+          transformSseChunk(trailing, stableResponse, outputItems, mapData),
         ))
       }
       outputItems.clear()

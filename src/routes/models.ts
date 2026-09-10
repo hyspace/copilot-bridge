@@ -19,6 +19,7 @@ modelRoutes.get("/", async (c) => {
   try {
     const upstream = await fetchCopilot(provider, `/models${search}`, {
       method: "GET",
+      signal: c.req.raw.signal,
       headers: {
         accept: c.req.header("accept") ?? "application/json",
       },

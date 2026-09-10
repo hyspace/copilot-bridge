@@ -1,0 +1,431 @@
+> Historical Copilot-only CLI documentation. The native Codex Bridge app supports Codex App only and uses the new gateway command. These legacy workflows are not the app setup instructions.
+
+<h1 align="center">copilot-bridge</h1>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/betahi-copilot-bridge"><img src="https://img.shields.io/npm/v/betahi-copilot-bridge.svg?v=0.20.19" alt="npm version"></a>
+  <a href="https://github.com/betahi/copilot-bridge/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/betahi-copilot-bridge.svg" alt="license"></a>
+</p>
+
+> Use GitHub Copilot as a local OpenAI/Anthropic-compatible API, so [Codex CLI](https://developers.openai.com/codex/cli), [Codex App](https://developers.openai.com/codex/app), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) and Continue can talk to Copilot with minimal configuration.
+
+> [!CAUTION]
+> This is an unofficial bridge for the GitHub Copilot API and may break if the
+> upstream API changes.
+
+## Contents
+- [Demo](#demo)
+- [Why this bridge?](#why-this-bridge)
+- [Install & run](#install--run)
+- [Configure Codex CLI or Codex App](#configure-codex-cli-or-codex-app)
+- [Configure Claude Code](#configure-claude-code)
+- [Web Search](#web-search)
+- [Start flags](#start-flags)
+- [Environment overrides](#environment-overrides)
+- [Supported models](#supported-models)
+- [Development](#development)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
+## Demo
+
+### Codex CLI
+
+![Codex demo](assets/screenshots/codex_demo.png)
+
+### Codex App
+
+![Codex App demo](assets/screenshots/codex_app_support.png)
+
+### Claude Code
+
+![Claude demo](assets/screenshots/claude_demo.png)
+
+## Why this bridge?
+
+copilot-bridge is more than a raw HTTP proxy:
+
+1. **Codex CLI, Codex App, and Claude support.** Exposes Codex `/v1/responses`,
+   Claude Code `/v1/messages`, and OpenAI-compatible chat, embeddings, and
+   models routes.
+2. **Tool call compatibility.** Adapts MCP tool names and tool call payloads to each upstream model's constraints, then restores the original tool identity for the client. This keeps real Claude Code and Codex CLI agent workflows working when MCP plugins expose long or model-incompatible tool names.
+3. **Web search support.** Model-selected web search can be executed by the
+   bridge and fed back into a final model pass.
+4. **End-to-end reasoning support.** Normalizes model aliases and
+   `reasoning_effort`, routes through the right upstream API, and preserves
+   returned `reasoning_text` / `reasoning_content` in streaming and
+   non-streaming responses.
+
+## Install & run
+
+```sh
+# one-time GitHub device login
+npx betahi-copilot-bridge@latest auth
+
+# start the bridge on 127.0.0.1:4142
+npx betahi-copilot-bridge@latest start
+```
+
+After startup the banner prints a **Usage Viewer** link of the form
+`https://betahi.github.io/copilot-bridge?endpoint=http://127.0.0.1:4142/usage`,
+which renders the Copilot quota snapshot (chat / completions / premium
+interactions) read from `GET /usage`.
+
+The bridge exposes both adapter-style endpoints (`/v1/responses`,
+`/v1/messages`) and the raw OpenAI-compatible surface
+(`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) so tools like
+LiteLLM, Continue, Cline and Aider work out of the box. CORS is enabled
+globally for browser-based clients.
+
+## Configure Codex CLI or Codex App
+
+Codex CLI and Codex App use the same provider config in
+**`~/.codex/config.toml`**. `start` writes a managed block into that file. You
+don't edit between the markers; the bridge regenerates that block on every
+start. To pin the **default model** for Codex clients, add your top-level keys
+above the managed block:
+
+```toml
+# User defaults; edit these freely.
+model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
+
+# >>> copilot-bridge managed block — auto-generated, do not edit between markers >>>
+model_provider = "bridge"
+model_supports_reasoning_summaries = true
+
+[model_providers.bridge]
+name = "Copilot Bridge"
+base_url = "http://127.0.0.1:4142/v1"
+wire_api = "responses"
+supports_websockets = false
+requires_openai_auth = false
+# <<< copilot-bridge managed block — edits outside this block are preserved <<<
+```
+
+Use `--no-codex-setup` to skip this writer if you manage
+`~/.codex/config.toml` yourself.
+
+Codex model discovery requests (`/v1/models?client_version=...`) receive a
+native Codex model catalog, generated from your account's available Copilot
+models. No per-model entries are needed in `config.toml`. This also lets new
+Responses models, such as `gpt-6-astra`, appear in the picker without a static
+bridge allowlist. Plain `/v1/models` requests keep the OpenAI-compatible format.
+Only enabled, picker-visible tool-calling models that the bridge can route are
+advertised.
+
+The managed config also keeps Codex CLI's `/status` context-window display in
+sync with Copilot model metadata. For example, GPT-5.5 shows a 1.05M context
+window through the bridge:
+
+![Codex context window](assets/screenshots/codex_2.png)
+
+### Codex warning: "Model metadata ... not found"
+
+This is a Codex client-side metadata warning, not a bridge routing failure, requests can still complete through the bridge.
+
+For 1M models, upstream still enforces a 1,000,000-token prompt
+limit (about 900k succeeds; around 1,000,046 is rejected as too long).
+
+## Configure Claude Code
+
+`copilot-bridge start` writes `ANTHROPIC_BASE_URL` and a dummy
+`ANTHROPIC_AUTH_TOKEN` into **`~/.claude/settings.json`**. Other settings are
+preserved; use `--no-claude-setup` to skip this writer.
+
+Minimal recommended config is:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4142",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_MODEL": "claude-opus-4.7",
+    "MODEL_REASONING_EFFORT": "medium"
+  }
+}
+```
+
+For Claude Code 1M context, use the `-[1m]` display form in
+`ANTHROPIC_MODEL`. Claude Code shows a 1M context window for this form, and the
+bridge maps it to the matching upstream Copilot model:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_MODEL": "claude-opus-4.8-[1m]"
+  }
+}
+```
+
+Slot-specific overrides:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4142",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_MODEL": "claude-opus-4.7",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4.6",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4.5",
+    "MODEL_REASONING_EFFORT": "medium"
+  }
+}
+```
+
+`MODEL_REASONING_EFFORT` (case-insensitive key lookup) is also read from the
+project-local `.claude/settings.json` and `.claude/settings.local.json` and
+applied to Claude requests only when the model supports reasoning. If it is not
+configured, Claude requests do not infer or attach a reasoning effort.
+
+## Web Search
+
+Not every Copilot model can run web search. Bridge-managed web search is enabled
+only when `COPILOT_WEB_SEARCH_BACKEND` is present and points to a supported
+backend. If the setting is missing, empty, or names an unsupported backend, the
+bridge treats web search as unsupported and passes the model response through
+normally.
+
+For Claude Code, configure web search in the user-level
+`~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "COPILOT_WEB_SEARCH_BACKEND": "gpt-5.5"
+  }
+}
+```
+
+For Codex CLI, configure the same backend as a top-level key in
+`~/.codex/config.toml`:
+
+```toml
+COPILOT_WEB_SEARCH_BACKEND = "gpt-5.5"
+```
+
+| Value | Search path | Requirement |
+| ----- | ----------- | ----------- |
+| Copilot model id, for example `gpt-5.6-luna` | Copilot HTTP `/responses` + `web_search_preview` | Recommended: `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`. |
+| `searxng`, use `"COPILOT_WEB_SEARCH_BACKEND": "searxng"` | Local SearXNG at `http://localhost:8080` | Start SearXNG yourself. Setup guide: https://github.com/betaHi/openclaw-searxng-search. |
+| `copilot-cli` or `copilot`, use `"COPILOT_WEB_SEARCH_BACKEND": "copilot-cli"` | GitHub Copilot CLI `web_search` tool, using the current request model | Install and sign in to GitHub Copilot CLI yourself. |
+
+Project-local Claude settings do not enable bridge-managed web search. Claude
+Code reads this setting only from the user-level `~/.claude/settings.json`; Codex
+CLI reads it only from the top level of `~/.codex/config.toml`.
+
+When a supported backend is configured, the bridge executes web search only after
+the model requests the WebSearch tool. It then sends the search context through a
+final model pass, so Claude Code and Codex CLI receive the WebSearch call plus
+the model's final reasoning/text response instead of raw search output alone.
+
+The bridge never installs Docker, SearXNG, or Copilot CLI automatically.
+
+## Start flags
+
+Common:
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--host <host>` | Bind address. Defaults to `127.0.0.1`. |
+| `--port <port>` | Listen port. Overrides `$PORT` and the port inferred from Claude settings. |
+| `--model <model>` | Override the request model for this bridge process only; does not edit config files. |
+| `--auto` | Acquire a Copilot Auto session and attach its session token only to upstream `/chat/completions` and `/responses` requests. Codex model selection is limited to Auto-available models. |
+| `--rate-limit <seconds>` | Enforce a minimum delay between upstream requests. |
+| `--wait` | With `--rate-limit`, wait instead of returning HTTP 429. |
+
+Codex:
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--no-codex-setup` | Skip writing the managed block into `~/.codex/config.toml`. |
+| `--no-prompt` | Never prompt for a Codex default model. |
+
+Claude:
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--no-claude-setup` | Skip writing `ANTHROPIC_BASE_URL` into `~/.claude/settings.json`. |
+
+Diagnostics:
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--debug` | Print extra upstream error diagnostics. |
+| `--show-token` | Print GitHub and Copilot tokens during startup. Sensitive; use only for local debugging. |
+
+`--debug` enables extra upstream error diagnostics in console logs.
+- Includes: token limits, stream mode, tool count, invalid tool names, and suspicious tool-schema paths.
+- Does not include: request messages, prompt text, bearer tokens, tool descriptions, or the full request body.
+
+**Review or redact debug logs before sharing them publicly.**
+
+### Codex HTTP compatibility
+
+`POST /v1/responses` accepts plain JSON or HTTP `Content-Encoding` values
+`gzip`, `deflate`, `br`, and `zstd`. Encodings are decoded before JSON parsing,
+in reverse order for stacked encodings (at most four layers). Zstd requires
+runtime support in `node:zlib`; older runtimes reject that encoding with 415
+instead of failing to start the bridge. The wire body and each decoded layer
+are limited to 64 MiB. This is a memory/transport limit, not a token limit.
+Malformed compressed data or JSON returns a structured 400, oversized bodies
+return 413, and unsupported encodings return 415. Errors never echo request
+contents. Client authentication headers are not forwarded to Copilot.
+
+The native Responses SSE normalizer accepts LF, CRLF, and CR line endings,
+optional whitespace after `data:`, and multiline data fields. It preserves
+Unicode text, private-use citation markers, source metadata and annotations;
+it does not invent source URLs or synthesize completion after a truncated
+stream. Rebuilt SSE responses drop obsolete body-length, encoding and integrity
+headers, while retaining request IDs and retry headers. Cancellation and
+upstream stream errors propagate through the normalizer.
+
+This is **not** an implementation of Codex's standalone `/alpha/search` API or
+of a citation renderer. The bridge's configured `web_search_backend` implements
+search inside Responses requests; it is not the standalone Alpha Search protocol.
+Native source/annotation preservation does not guarantee that every Codex UI
+will render every citation marker. Missing sources must be diagnosed upstream,
+not replaced with guessed links.
+
+For protocol regression tests, run `bun test`. Run `bun run test:http` for an
+additional HTTP smoke test using two ephemeral loopback servers and fake tokens
+(no real model calls and no changes to user configuration).
+
+## Environment overrides
+
+| Variable                   | Purpose                                              |
+| -------------------------- | ---------------------------------------------------- |
+| `COPILOT_TOKEN`            | Pre-issued Copilot bearer token (skip device login). |
+| `COPILOT_ACCOUNT_TYPE`     | `individual` \| `business` \| `enterprise`.          |
+| `COPILOT_BASE_URL`         | Override the upstream Copilot base URL.              |
+| `COPILOT_VSCODE_VERSION`   | Override the VS Code version sent upstream.          |
+| `MODEL_REASONING_EFFORT`   | Claude-side reasoning effort override.              |
+| `HTTP_PROXY` / `HTTPS_PROXY` | Route outbound GitHub/Copilot requests through an HTTP proxy. |
+| `NO_PROXY`                 | Hosts that should bypass `HTTP_PROXY` / `HTTPS_PROXY`. |
+
+Proxy example:
+
+```sh
+HTTPS_PROXY=http://127.0.0.1:7890 npx betahi-copilot-bridge@latest start
+```
+
+## Supported models
+
+The bridge resolves aliases and clamps reasoning effort to what each model
+accepts upstream.
+
+### GPT-5 family — native Responses passthrough
+
+| Model           | Reasoning efforts                        |
+| --------------- | ---------------------------------------- |
+| `gpt-5.6-luna`  | `none`, `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.6-sol`   | `none`, `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.6-terra` | `none`, `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.5`       | `none`, `low`, `medium`, `high`, `xhigh` |
+| `gpt-5.4`       | `low`, `medium`, `high`, `xhigh`         |
+| `gpt-5.4-mini`  | `none`, `low`, `medium`                  |
+| `gpt-5.3-codex` | `low`, `medium`, `high`, `xhigh`         |
+| `gpt-5-mini`    | `low`, `medium`, `high`                  |
+
+### Claude family — translated to chat completions
+
+| Model                            | Reasoning efforts                       | Notes                                  |
+| -------------------------------- | --------------------------------------- | -------------------------------------- |
+| `claude-opus-4.8`                | `low`, `medium`, `high`, `xhigh`, `max` |                                        |
+| `claude-opus-4.8-1m`             | `low`, `medium`, `high`, `xhigh`, `max` | 1M-token context window, prefer use `claude-opus-4.8-[1m]` in config. |
+| `claude-opus-4.7`                | `low`, `medium`, `high`, `xhigh`, `max` | Effort sent as `output_config.effort`. |
+| `claude-opus-4.7-1m`             | `low`, `medium`, `high`, `xhigh`, `max` | 1M-token context window, prefer use `claude-opus-4.7-[1m]` in config. |
+| `claude-opus-4.6`                | `low`, `medium`, `high`, `max`          |                                        |
+| `claude-opus-4.6-1m`             | `low`, `medium`, `high`, `max`          | 1M-token context window, prefer use `claude-opus-4.6-[1m]` in config              |
+| `claude-sonnet-5`                | `low`, `medium`, `high`, `xhigh`, `max` |                                        |
+| `claude-sonnet-4.6`              | `low`, `medium`, `high`, `max`          |                                        |
+| `claude-opus-4.5`                | —                                       | Reasoning not accepted upstream.       |
+| `claude-sonnet-4.5`              | —                                       | Reasoning not accepted upstream.       |
+| `claude-haiku-4.5`               | —                                       | Reasoning not accepted upstream.       |
+
+For Claude Code settings, prefer `claude-opus-4.8-[1m]`,
+`claude-opus-4.7-[1m]`, or `claude-opus-4.6-[1m]` when you want the CLI
+`/context` UI and the upstream model to both use 1M context. Direct API clients
+can use the corresponding model ids listed in the table.
+
+### Gemini family — translated to chat completions
+
+| Model                    | Aliases          |
+| ------------------------ | ---------------- |
+| `gemini-3.1-pro-preview` | `gemini-3.1-pro` |
+| `gemini-3-flash-preview` | `gemini-3-flash` |
+| `gemini-2.5-pro`         | —                |
+
+### Legacy
+
+`gpt-4.1`, `gpt-4o` — chat-only upstream, no reasoning parameter.
+
+### Reasoning effort
+
+For OpenAI-compatible clients, unsupported reasoning values are clamped to the
+model capability table instead of being forwarded upstream. If a request omits
+reasoning effort, the bridge leaves it omitted rather than inferring a default.
+Claude-side reasoning can be set globally via `MODEL_REASONING_EFFORT` (env, or
+`env` in `~/.claude/settings.json`); invalid Claude-side values are ignored,
+and per-request `reasoning_effort` takes precedence.
+Codex CLI does not accept `max` in `model_reasoning_effort`; when Codex config
+contains `max`, the bridge writes `xhigh` and clamps it to the closest upstream
+effort accepted by the selected model.
+
+## Development
+
+Requires [Bun](https://bun.sh) ≥ 1.2.
+
+```sh
+bun install
+bun run dev          # watch mode against src/main.ts
+bun test             # run all tests (bun test runner)
+bun run typecheck    # tsc --noEmit
+bun run build        # produce dist/main.js with tsdown
+
+# run directly from source (no build, no npx); --port specifies the port
+bun run ./src/main.ts start --host 127.0.0.1 --port 4141 --no-prompt
+```
+
+Adding another CLI: drop a new translator under `src/bridges/<client>/`,
+reuse `src/services/copilot/` for upstream calls, register routes in
+`src/server.ts`, and add tests under `tests/`.
+
+## Native supervisor integration
+
+Optional environment variables support native wrappers without changing the
+default CLI behavior:
+
+| Variable | Behavior |
+| --- | --- |
+| `COPILOT_BRIDGE_INSTANCE_ID` | Add the supplied instance identifier to `/healthz` so a supervisor can verify process ownership. |
+| `COPILOT_BRIDGE_EVENTS_TOKEN` | Enable `@@CBM:` JSONL metadata events on stdout, carrying this per-launch channel token. No prompts, model output or authentication credentials are included. Keep the channel token private and use a fresh value per launch. |
+
+Usage events contain a unique request ID, model, timestamp, HTTP status,
+input/output/cached token counts when returned by the API, and completion outcome.
+Missing usage stays `null`. Discarded retry responses are recorded and cancelled.
+SSE observation is bounded and byte-transparent; the Codex normalizer also
+propagates backpressure and downstream cancellation.
+
+Device authorization emits `authRequired`, `authSuccess` and `authFailed` events
+when the metadata channel is enabled. The `auth` command is one-shot and does not
+install the server's recurring token-refresh timer. Normal `start` still refreshes
+tokens, with overlapping refreshes prevented.
+
+Codex setup writes `supports_websockets = false` (not `prefer_websockets`) and
+preserves an existing explicit `requires_openai_auth` choice.
+Native builds can define `__BRIDGE_VERSION__` at bundle time; ordinary CLI runs
+continue to read the package version normally.
+
+Inbound API requests do not require a bridge access key. Binding to a LAN
+interface permits devices on that network to use the service; use trusted
+networks only and do not expose this unencrypted listener to the Internet.
+
+## Acknowledgements
+
+Claude Code bridge notes inspired by
+[ericc-ch/copilot-api](https://github.com/ericc-ch/copilot-api). Respect.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
